@@ -85,9 +85,41 @@ def setup_ttk_styles():
         relief="flat"
     )
     
+    # Anomaly Treeview (Unusual Spending Alerts Table) Styling
+    style.configure(
+        "Anomaly.Treeview",
+        background=BG_CARD,
+        foreground=TEXT_PRIMARY,
+        fieldbackground=BG_CARD,
+        rowheight=32,
+        font=FONT_BODY,
+        borderwidth=0
+    )
+    style.map(
+        "Anomaly.Treeview",
+        background=[('selected', "#2d303b")],
+        foreground=[('selected', ACCENT)]
+    )
+    style.configure(
+        "Anomaly.Treeview.Heading",
+        background=BG_SIDEBAR,
+        foreground=TEXT_PRIMARY,
+        font=FONT_BODY_BOLD,
+        borderwidth=1,
+        relief="flat"
+    )
+
     # Scrollbar Styling
     style.configure(
         "Vertical.TScrollbar",
+        gripcount=0,
+        background=BG_CARD,
+        troughcolor=BG_MAIN,
+        bordercolor=BG_MAIN,
+        arrowcolor=TEXT_MUTED
+    )
+    style.configure(
+        "Horizontal.TScrollbar",
         gripcount=0,
         background=BG_CARD,
         troughcolor=BG_MAIN,

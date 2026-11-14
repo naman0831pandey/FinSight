@@ -1,10 +1,18 @@
 import os
+import xml.sax.saxutils
 from datetime import datetime
 import matplotlib.pyplot as plt
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+
+def _safe_xml(text):
+    """Safely escapes XML/HTML entities for ReportLab Paragraph rendering."""
+    if text is None:
+        return ""
+    return xml.sax.saxutils.escape(str(text))
 
 class PDFReportGenerator:
     @staticmethod
@@ -112,7 +120,7 @@ class PDFReportGenerator:
             ],
             [
                 Paragraph("<b>Net Savings:</b>", body_style), Paragraph(f"₹{summary_data['savings']:,.2f}", bold_body_style),
-                Paragraph("<b>Current Status:</b>", body_style), Paragraph(health_data['status'], bold_body_style)
+                Paragraph("<b>Current Status:</b>", body_style), Paragraph(_safe_xml(health_data['status']), bold_body_style)
             ]
         ]
         
@@ -139,7 +147,7 @@ class PDFReportGenerator:
         for cat, amt in category_spending.items():
             pct = (amt / total_exp) * 100
             cat_rows.append([
-                Paragraph(cat, body_style),
+                Paragraph(_safe_xml(cat), body_style),
                 Paragraph(f"₹{amt:,.2f}", body_style),
                 Paragraph(f"{pct:.1f}%", body_style)
             ])
@@ -185,7 +193,7 @@ class PDFReportGenerator:
             ]]
             for g in goals_list:
                 goal_rows.append([
-                    Paragraph(g.name, body_style),
+                    Paragraph(_safe_xml(g.name), body_style),
                     Paragraph(f"₹{g.target_amount:,.2f}", body_style),
                     Paragraph(f"₹{g.current_savings:,.2f}", body_style),
                     Paragraph(f"{g.progress_percentage}%", bold_body_style)
@@ -220,10 +228,10 @@ class PDFReportGenerator:
             type_color = "#10b981" if t.type == "Income" else "#ef4444"
             tx_rows.append([
                 Paragraph(t.date, body_style),
-                Paragraph(f"<font color='{type_color}'><b>{t.type}</b></font>", body_style),
-                Paragraph(t.category, body_style),
+                Paragraph(f"<font color='{type_color}'><b>{_safe_xml(t.type)}</b></font>", body_style),
+                Paragraph(_safe_xml(t.category), body_style),
                 Paragraph(f"₹{t.amount:,.2f}", body_style),
-                Paragraph(t.notes if t.notes else "-", body_style)
+                Paragraph(_safe_xml(t.notes) if t.notes else "-", body_style)
             ])
             
         if not transactions_list:
@@ -419,8 +427,8 @@ class PDFReportGenerator:
         # --- Bill To ---
         story.append(Paragraph("<b>BILLED TO:</b>", section_heading))
         bill_to_data = [
-            [Paragraph("<b>Customer Name:</b>", body_style), Paragraph(customer_name, body_style)],
-            [Paragraph("<b>Payment Method:</b>", body_style), Paragraph(payment_method, body_style)]
+            [Paragraph("<b>Customer Name:</b>", body_style), Paragraph(_safe_xml(customer_name), body_style)],
+            [Paragraph("<b>Payment Method:</b>", body_style), Paragraph(_safe_xml(payment_method), body_style)]
         ]
         bill_to_table = Table(bill_to_data, colWidths=[120, 420])
         bill_to_table.setStyle(TableStyle([
@@ -440,7 +448,7 @@ class PDFReportGenerator:
                 Paragraph("Total Amount (₹)", table_header_style)
             ],
             [
-                Paragraph(product_name, body_style),
+                Paragraph(_safe_xml(product_name), body_style),
                 Paragraph(f"₹{price:,.2f}", body_style),
                 Paragraph(f"{gst_pct}%", body_style),
                 Paragraph(f"₹{gst_amount:,.2f}", body_style),

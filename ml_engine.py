@@ -301,7 +301,7 @@ class SpendingAnomalyDetector:
         
         features = df[['amount', 'cat_ratio', 'z_score']].fillna(0.0)
         
-        iso = IsolationForest(contamination=0.25, random_state=42)
+        iso = IsolationForest(contamination=0.12, random_state=42)
         preds = iso.fit_predict(features)
         
         anomalies = []
@@ -310,12 +310,31 @@ class SpendingAnomalyDetector:
             ratio = float(row['cat_ratio'])
             amt = float(row['amount'])
             z = float(row['z_score'])
+            cat_med = float(cat_means.iloc[idx])
             
-            # Anomaly criteria: flagged by Isolation Forest OR extreme z-score/ratio
-            is_anomaly = (pred == -1) or (z > 1.5) or (ratio >= 2.5 and amt > 1000) or (amt >= max(global_median * 3.0, 15000.0))
+            # Anomaly criteria: Must represent genuine spending spikes or abnormal expenditures
+            is_anomaly = False
+            severity = "Moderate"
+            reason = ""
+
+            if (ratio >= 1.6 and amt >= 2000) or (amt >= max(global_median * 3.0, 18000.0) and ratio >= 1.2):
+                is_anomaly = True
+                severity = "Critical" if (amt >= 20000 or ratio >= 2.5) else "Moderate"
+                reason = f"High spend spike: ₹{amt:,.0f} is {ratio:.1f}x higher than standard {row['category']} median (₹{cat_med:,.0f})"
+            elif z >= 1.5 and amt > cat_med and amt >= 2500:
+                is_anomaly = True
+                severity = "Moderate"
+                reason = f"Statistical outlier: ₹{amt:,.0f} is notably above typical {row['category']} spend (+{z:.1f}σ)"
+            elif pred == -1 and amt > cat_med and ratio >= 1.2 and amt >= 3000:
+                is_anomaly = True
+                severity = "Moderate"
+                reason = f"Unusual spend pattern: ₹{amt:,.0f} exceeds typical {row['category']} baseline (₹{cat_med:,.0f})"
+            elif ratio >= 1.25 and amt > cat_med and amt >= 3500:
+                is_anomaly = True
+                severity = "Moderate"
+                reason = f"Above-average spend: ₹{amt:,.0f} is {ratio:.1f}x typical {row['category']} expenditure"
+
             if is_anomaly:
-                severity = "Critical" if (amt >= 20000 or ratio >= 3.5) else "Moderate"
-                reason = f"High spend spike: ₹{amt:,.0f} is {ratio:.1f}x higher than standard {row['category']} transactions"
                 anomalies.append({
                     "id": int(row['id']),
                     "date": str(row['date']),

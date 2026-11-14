@@ -39,9 +39,31 @@ env/
 
 # Scratch & Temporary files
 scratch/
-backups/auto_backup_before_reset_*.db
+backups/
 *.log
 *.tmp
+temp_*.png
+temp_*.jpg
+temp_*.jpeg
+
+# Databases, WAL journals, and DB dumps (Runtime data)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Reports and Document Exports
+*.pdf
+*.csv
+transactions.json
+settings.json
+
+# Environment Secrets
+.env
+.env.*
+!.env.example
 
 # Operating System Files
 .DS_Store

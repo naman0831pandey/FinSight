@@ -3,8 +3,10 @@ from tkinter import messagebox, ttk, filedialog
 from datetime import datetime, date
 import shutil
 import os
+import re
 import pandas as pd
 import numpy as np
+import sqlite3
 
 # Matplotlib integration
 import matplotlib
@@ -17,8 +19,11 @@ import gui_theme as theme
 from tracker_oop import BudgetTracker
 import analytics
 from pdf_generator import PDFReportGenerator
+from db_manager import DatabaseManager
 import ml_engine
 import gui_ai_view
+import gui_excel_view
+import gui_biz_excel_view
 
 def clean_amount_str(val_str):
     if not val_str:
@@ -107,6 +112,7 @@ class SmartBudgetTrackerApp(tk.Tk):
         self.pages["suggestions"] = self.create_suggestions_page()
         self.pages["exports"] = self.create_exports_page()
         self.pages["ai_insights"] = gui_ai_view.create_ai_insights_page(self)
+        self.pages["excel_import"] = gui_excel_view.create_excel_import_page(self)
         
         # Business Pages
         self.pages["biz_dashboard"] = self.create_biz_dashboard_page()
@@ -121,6 +127,7 @@ class SmartBudgetTrackerApp(tk.Tk):
         self.pages["biz_cashflow"] = self.create_biz_cashflow_page()
         self.pages["biz_payroll"] = self.create_biz_payroll_page()
         self.pages["biz_invoice"] = self.create_biz_invoice_page()
+        self.pages["biz_excel_import"] = gui_biz_excel_view.create_biz_excel_import_page(self)
 
     def switch_page(self, page_name):
         if self.current_page:
@@ -176,6 +183,8 @@ class SmartBudgetTrackerApp(tk.Tk):
             self.refresh_exports(df)
         elif page_name == "ai_insights":
             self.refresh_ai_insights()
+        elif page_name == "excel_import":
+            gui_excel_view.refresh_excel_import_page(self)
         elif page_name.startswith("biz_"):
             self.refresh_biz_page(page_name)
 
@@ -257,31 +266,29 @@ class SmartBudgetTrackerApp(tk.Tk):
         self.gauge.place(relx=0.5, rely=0.5, anchor="center")
 
         # Mid section: Budget Alert Progress bar
-        budget_card = theme.Card(frame, width=680, height=110)
+        budget_card = theme.Card(frame, width=680, height=115)
         budget_card.pack(fill="x", padx=25, pady=15)
         
-        # Labels for budget card
+        # Header container spanning top width of the card
+        budget_header = tk.Frame(budget_card, bg=theme.BG_CARD)
+        budget_header.place(x=20, y=12, relwidth=0.94)
+
+        # Left box: Budget limit label + Set Limit button side by side (dynamic flow)
+        left_box = tk.Frame(budget_header, bg=theme.BG_CARD)
+        left_box.pack(side="left")
+
         self.budget_limit_lbl = tk.Label(
-            budget_card, 
+            left_box, 
             text="Monthly Budget Limit: ₹0.00", 
             font=theme.FONT_BODY_BOLD, 
             fg=theme.TEXT_PRIMARY, 
             bg=theme.BG_CARD
         )
-        self.budget_limit_lbl.place(x=20, y=15)
-
-        self.budget_alert_lbl = tk.Label(
-            budget_card, 
-            text="Status: Normal (0% used)", 
-            font=theme.FONT_BODY_BOLD, 
-            fg=theme.INCOME, 
-            bg=theme.BG_CARD
-        )
-        self.budget_alert_lbl.place(relx=0.95, y=15, anchor="ne")
+        self.budget_limit_lbl.pack(side="left")
 
         # Budget limit configuration button
         set_budget_btn = tk.Button(
-            budget_card,
+            left_box,
             text="⚙ Set Limit",
             font=theme.FONT_SMALL,
             fg=theme.ACCENT,
@@ -290,9 +297,21 @@ class SmartBudgetTrackerApp(tk.Tk):
             relief="solid",
             highlightthickness=0,
             cursor="hand2",
+            padx=8,
+            pady=2,
             command=self.configure_budget_limit
         )
-        set_budget_btn.place(x=220, y=14)
+        set_budget_btn.pack(side="left", padx=(10, 0))
+
+        # Right box: Status / alert label
+        self.budget_alert_lbl = tk.Label(
+            budget_header, 
+            text="Status: Normal (0% used)", 
+            font=theme.FONT_BODY_BOLD, 
+            fg=theme.INCOME, 
+            bg=theme.BG_CARD
+        )
+        self.budget_alert_lbl.pack(side="right")
 
         # Progress bar (ttk styled)
         self.budget_progress = ttk.Progressbar(budget_card, orient="horizontal", mode="determinate")
@@ -305,7 +324,7 @@ class SmartBudgetTrackerApp(tk.Tk):
             fg=theme.TEXT_MUTED, 
             bg=theme.BG_CARD
         )
-        self.budget_spent_lbl.place(x=20, y=82)
+        self.budget_spent_lbl.place(x=20, y=84)
 
 
         # Bottom section: Charts Panel
@@ -409,22 +428,50 @@ class SmartBudgetTrackerApp(tk.Tk):
             # --- Chart 1: Expenses Pie Chart ---
             cat_spending = analytics.get_category_wise_spending(df, today.year, today.month)
             if cat_spending:
-                categories = list(cat_spending.keys())
-                amounts = list(cat_spending.values())
-                colors_list = ['#10b981', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#6b7280']
+                # Consolidate minor categories (< 5% of total or beyond top 5) into "Others"
+                # to prevent crowded, overlapping slice labels when many small categories exist.
+                total_cat_spending = sum(cat_spending.values())
+                sorted_cats = sorted(cat_spending.items(), key=lambda x: x[1], reverse=True)
+
+                can_keep_all = len(sorted_cats) <= 6 and all((amt / total_cat_spending * 100) >= 5.0 for _, amt in sorted_cats)
+
+                if can_keep_all:
+                    categories = [c for c, _ in sorted_cats]
+                    amounts = [a for _, a in sorted_cats]
+                else:
+                    categories = []
+                    amounts = []
+                    others_amt = 0.0
+                    for i, (cat, amt) in enumerate(sorted_cats):
+                        pct = (amt / total_cat_spending) * 100 if total_cat_spending > 0 else 0
+                        if i < 5 and pct >= 5.0:
+                            categories.append(cat)
+                            amounts.append(amt)
+                        else:
+                            others_amt += amt
+                    if others_amt > 0:
+                        categories.append("Others")
+                        amounts.append(others_amt)
+
+                formatted_labels = [c[:18] + ".." if len(c) > 20 else c for c in categories]
+                colors_list = ['#10b981', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#64748b']
                 
                 wedges, texts, autotexts = ax1.pie(
                     amounts, 
-                    labels=categories, 
-                    autopct='%1.0f%%', 
+                    labels=formatted_labels, 
+                    autopct=lambda pct: f'{pct:.0f}%' if pct >= 4 else '', 
                     startangle=140, 
-                    colors=colors_list[:len(categories)],
-                    textprops=dict(color=theme.TEXT_PRIMARY)
+                    colors=colors_list[:len(amounts)],
+                    textprops=dict(color=theme.TEXT_PRIMARY, fontsize=8),
+                    pctdistance=0.68,
+                    radius=0.9,
+                    wedgeprops=dict(edgecolor=theme.BG_CARD, linewidth=1.5)
                 )
                 # Style inner percent labels
                 for autotext in autotexts:
                     autotext.set_color('white')
-                    autotext.set_fontsize(8)
+                    autotext.set_fontsize(7.5)
+                    autotext.set_weight('bold')
                 ax1.set_title("Expense Distribution", color=theme.TEXT_PRIMARY, fontdict={'fontsize': 10, 'weight': 'bold'})
             else:
                 ax1.text(0.5, 0.5, 'No Expense Data', ha='center', va='center', color=theme.TEXT_MUTED)
@@ -592,6 +639,12 @@ class SmartBudgetTrackerApp(tk.Tk):
         self.filter_cat_cmb.pack(side="left", padx=5, pady=15)
         self.filter_cat_cmb.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
 
+        tk.Label(filter_card, text="Source:", font=theme.FONT_BODY_BOLD, fg=theme.TEXT_PRIMARY, bg=theme.BG_CARD).pack(side="left", padx=(10,5))
+        self.filter_source_var = tk.StringVar(value="All")
+        self.filter_source_cmb = ttk.Combobox(filter_card, textvariable=self.filter_source_var, values=["All", "Manual", "Imported"], state="readonly", width=10)
+        self.filter_source_cmb.pack(side="left", padx=5, pady=15)
+        self.filter_source_cmb.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
+
         # Clear Filters button
         btn_reset_filters = tk.Button(
             filter_card,
@@ -615,7 +668,7 @@ class SmartBudgetTrackerApp(tk.Tk):
         table_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
         # columns definition
-        columns = ("id", "type", "category", "amount", "date", "notes")
+        columns = ("id", "type", "category", "amount", "date", "notes", "source")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", style="Treeview")
         
         self.tree.heading("id", text="ID")
@@ -624,13 +677,15 @@ class SmartBudgetTrackerApp(tk.Tk):
         self.tree.heading("amount", text="Amount (₹)")
         self.tree.heading("date", text="Date")
         self.tree.heading("notes", text="Notes")
+        self.tree.heading("source", text="Source")
 
-        self.tree.column("id", width=40, anchor="center")
-        self.tree.column("type", width=70, anchor="center")
-        self.tree.column("category", width=100, anchor="w")
-        self.tree.column("amount", width=90, anchor="e")
-        self.tree.column("date", width=90, anchor="center")
-        self.tree.column("notes", width=150, anchor="w")
+        self.tree.column("id", width=35, anchor="center")
+        self.tree.column("type", width=65, anchor="center")
+        self.tree.column("category", width=95, anchor="w")
+        self.tree.column("amount", width=85, anchor="e")
+        self.tree.column("date", width=85, anchor="center")
+        self.tree.column("notes", width=125, anchor="w")
+        self.tree.column("source", width=90, anchor="center")
 
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview, style="Vertical.TScrollbar")
         self.tree.configure(yscrollcommand=scrollbar.set)
@@ -643,6 +698,21 @@ class SmartBudgetTrackerApp(tk.Tk):
         # Actions buttons under table
         table_actions = tk.Frame(right_panel, bg=theme.BG_MAIN)
         table_actions.pack(fill="x", pady=10)
+
+        self.btn_import_excel = tk.Button(
+            table_actions,
+            text="📥 Import Excel",
+            font=theme.FONT_BODY_BOLD,
+            fg=theme.TEXT_DARK,
+            bg=theme.ACCENT,
+            activebackground=theme.ACCENT,
+            bd=0,
+            padx=15,
+            pady=8,
+            cursor="hand2",
+            command=lambda: self.switch_page("excel_import")
+        )
+        self.btn_import_excel.pack(side="left", padx=5)
 
         self.btn_delete_tx = tk.Button(
             table_actions,
@@ -801,26 +871,35 @@ class SmartBudgetTrackerApp(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         for t in transactions:
             notes = t.notes if t.notes else "-"
-            # Display colored rows
-            self.tree.insert("", "end", values=(t.id, t.type, t.category, f"₹{t.amount:,.2f}", t.date, notes))
+            source_tag = getattr(t, "source", None)
+            is_imp = getattr(t, "is_imported", False) or source_tag == "Imported"
+            source_display = "📥 Excel" if is_imp else "✍️ Manual"
+            self.tree.insert("", "end", values=(t.id, t.type, t.category, f"₹{t.amount:,.2f}", t.date, notes, source_display))
 
     def apply_filters(self):
         key = self.filter_key_var.get().strip()
         cat = self.filter_cat_var.get()
+        source_var = getattr(self, "filter_source_var", None)
+        source_val = source_var.get() if source_var else "All"
         
         cat_filter = None if cat == "All" else cat
         key_filter = None if key == "" else key
+        source_filter = None if source_val == "All" else source_val
 
-        filtered_rows = self.tracker.db.search_transactions(keyword=key_filter, category=cat_filter)
+        filtered_rows = self.tracker.db.search_transactions(keyword=key_filter, category=cat_filter, profile="Personal", source=source_filter)
         self.tree.delete(*self.tree.get_children())
         for row in filtered_rows:
-            # row: (id, type, amount, category, date, notes)
+            # row: (id, type, amount, category, date, notes, profile, import_batch_id, source)
             notes = row[5] if row[5] else "-"
-            self.tree.insert("", "end", values=(row[0], row[1], row[3], f"₹{row[2]:,.2f}", row[4], notes))
+            source_tag = row[8] if len(row) > 8 and row[8] else ("Imported" if len(row) > 7 and row[7] else "Manual")
+            source_display = "📥 Excel" if source_tag == "Imported" else "✍️ Manual"
+            self.tree.insert("", "end", values=(row[0], row[1], row[3], f"₹{row[2]:,.2f}", row[4], notes, source_display))
 
     def reset_filters(self):
         self.filter_key_var.set("")
         self.filter_cat_var.set("All")
+        if hasattr(self, "filter_source_var"):
+            self.filter_source_var.set("All")
         self.refresh_page_data("transactions")
 
     # ==========================================
@@ -1217,7 +1296,7 @@ class SmartBudgetTrackerApp(tk.Tk):
         
         info_lbl = tk.Label(
             search_card, 
-            text="Thinking of buying something expensive? Enter your product and budget below to independently search and compare\nreal-time prices across Amazon India, Flipkart, Croma, and Reliance Digital without platform bias.", 
+            text="Thinking of buying something expensive? Enter your product and budget below to independently search and compare\nreal-time prices across Amazon India and Flipkart without platform bias.", 
             font=theme.FONT_BODY, 
             fg=theme.TEXT_MUTED, 
             bg=theme.BG_CARD,
@@ -1242,7 +1321,7 @@ class SmartBudgetTrackerApp(tk.Tk):
         # Run Button
         btn_run = tk.Button(
             input_frame, 
-            text="🔍 Compare 4 Platforms", 
+            text="🔍 Compare Prices", 
             font=theme.FONT_BODY_BOLD, 
             bg=theme.ACCENT, 
             fg=theme.TEXT_DARK, 
@@ -1262,7 +1341,7 @@ class SmartBudgetTrackerApp(tk.Tk):
         # Welcome Placeholder
         self.suggest_placeholder = tk.Label(
             self.suggest_results_frame, 
-            text="Enter a product name (e.g. 'iPhone 15', 'Samsung S24', 'LG TV 32 inch')\nand your expected budget above to search all four platforms.",
+            text="Enter a product name (e.g. 'iPhone 15', 'Samsung S24', 'LG TV 32 inch')\nand your expected budget above to search supported platforms (Amazon India & Flipkart).",
             font=theme.FONT_BODY, 
             fg="#4b5563", 
             bg=theme.BG_MAIN
@@ -1272,7 +1351,12 @@ class SmartBudgetTrackerApp(tk.Tk):
         return page
 
     def run_suggestions_engine(self):
-        item_keyword = self.suggest_name_entry.get().strip()
+        raw_keyword = self.suggest_name_entry.get().strip()
+        # Sanitize query: strip control characters, limit length to 100 chars
+        item_keyword = re.sub(r'[\r\n\t\x00-\x1f\x7f-\x9f]', ' ', raw_keyword).strip()
+        if len(item_keyword) > 100:
+            item_keyword = item_keyword[:100].strip()
+
         price_str = clean_amount_str(self.suggest_price_entry.get())
 
         if not item_keyword or not price_str:
@@ -1297,8 +1381,8 @@ class SmartBudgetTrackerApp(tk.Tk):
         
         tk.Label(
             loading_box,
-            text="🔍 Searching 4 E-Commerce Platforms...\n"
-                 "• Amazon India   • Flipkart   • Croma   • Reliance Digital\n\n"
+            text="🔍 Searching E-Commerce Platforms...\n"
+                 "• Amazon India   • Flipkart\n\n"
                  "Fetching real-time product listings and verifying prices. Please wait...",
             font=theme.FONT_BODY_BOLD,
             fg=theme.ACCENT,
@@ -1580,9 +1664,9 @@ class SmartBudgetTrackerApp(tk.Tk):
                 pr_color = theme.INCOME if is_best else theme.TEXT_PRIMARY
                 pr_font = ("Segoe UI", 11, "bold") if is_best else theme.FONT_BODY_BOLD
             else:
-                pr_text = "Price unavailable"
-                pr_color = theme.TEXT_MUTED
-                pr_font = theme.FONT_BODY
+                pr_text = "Check in Store" if offer.url else "Price unavailable"
+                pr_color = theme.ACCENT if offer.url else theme.TEXT_MUTED
+                pr_font = theme.FONT_SMALL
             tk.Label(price_cell, text=pr_text, font=pr_font, fg=pr_color, bg=row_bg, anchor="e").pack(fill="x", pady=(8, 0))
 
             # 4. Budget Status Cell
@@ -1604,6 +1688,18 @@ class SmartBudgetTrackerApp(tk.Tk):
             if offer.is_verified:
                 v_text = "✅ Verified Live"
                 v_color = theme.INCOME
+            elif "WAF" in offer.status or "restricted" in offer.status:
+                v_text = "🛡️ Akamai WAF (Open Link)"
+                v_color = "#f59e0b"
+            elif "SPA" in offer.status:
+                v_text = "⚡ React SPA (Open Link)"
+                v_color = "#38bdf8"
+            elif "Anti-bot" in offer.status:
+                v_text = "🤖 Anti-bot (Open Link)"
+                v_color = "#f59e0b"
+            elif "installed" in offer.status:
+                v_text = "⚠️ Missing Libs"
+                v_color = theme.EXPENSE
             else:
                 v_text = "⚠️ " + (offer.status.split("(")[0].strip() if "(" in offer.status else offer.status)
                 v_color = theme.TEXT_MUTED
@@ -1643,14 +1739,27 @@ class SmartBudgetTrackerApp(tk.Tk):
 
         # Table Footer Tip & Verification Info
         footer_frame = tk.Frame(results_panel, bg=theme.BG_MAIN)
-        footer_frame.pack(fill="x", pady=(6, 12))
+        footer_frame.pack(fill="x", pady=(6, 8))
 
         tk.Label(
             footer_frame,
-            text=f"🕒 Last Checked: {comp_res.checked_time}   |   🛡️ Search Status: {comp_res.verified_count} of {comp_res.total_count} platforms verified live   |   💡 Tip: Click 'View Deal' on any row or 'Visit Cheapest Deal' to open exact listings.",
+            text=f"🕒 Last Checked: {comp_res.checked_time}   |   🛡️ Search Status: {comp_res.verified_count} of {comp_res.total_count} platforms verified live   |   💡 Tip: Click '🔗 View Deal' on any row or '🛒 Visit Cheapest Deal' to open exact listings.",
             font=theme.FONT_SMALL,
             fg=theme.TEXT_MUTED,
             bg=theme.BG_MAIN
+        ).pack(anchor="w")
+
+        note_card = tk.Frame(results_panel, bg=theme.BG_CARD, highlightbackground=theme.BORDER, highlightthickness=1, padx=12, pady=8)
+        note_card.pack(fill="x", pady=(0, 10))
+        tk.Label(
+            note_card,
+            text="💡 Store Status Notice: Flipkart and Amazon are verified via real-time live catalog search. "
+                 "Use the '🔗 View Deal' buttons to check live deals and promotions directly in your browser.",
+            font=theme.FONT_SMALL,
+            fg=theme.TEXT_MUTED,
+            bg=theme.BG_CARD,
+            justify="left",
+            wraplength=950
         ).pack(anchor="w")
 
 
@@ -1701,31 +1810,91 @@ class SmartBudgetTrackerApp(tk.Tk):
     # --- INSIGHTS & EXPORTS PAGE ---
     # ==========================================
     def create_exports_page(self):
-        page = tk.Frame(self.content_container, bg=theme.BG_MAIN)
+        page = ScrollableFrame(self.content_container)
+        frame = page.scrollable_frame
 
         # Header
-        top_bar = tk.Frame(page, bg=theme.BG_MAIN)
-        top_bar.pack(fill="x", padx=25, pady=20)
+        top_bar = tk.Frame(frame, bg=theme.BG_MAIN)
+        top_bar.pack(fill="x", padx=25, pady=(20, 10))
         title = tk.Label(top_bar, text="Spending Insights & Exports", font=theme.FONT_TITLE, fg=theme.TEXT_PRIMARY, bg=theme.BG_MAIN)
         title.pack(side="left")
+        subtitle = tk.Label(top_bar, text="Pandas-driven analytics, monthly trends & reporting suite", font=theme.FONT_SMALL, fg=theme.TEXT_MUTED, bg=theme.BG_MAIN)
+        subtitle.pack(side="left", padx=(15, 0), pady=(6, 0))
 
-        # Two main panels: Insights Card (top/left) + Export Card (right/bottom)
-        main_layout = tk.Frame(page, bg=theme.BG_MAIN)
+        # Financial Summary Cards Row (4 KPI cards)
+        self.exports_kpi_frame = tk.Frame(frame, bg=theme.BG_MAIN)
+        self.exports_kpi_frame.pack(fill="x", padx=25, pady=(5, 15))
+        self.exports_kpi_frame.columnconfigure((0, 1, 2, 3), weight=1, uniform="kpi")
+
+        # KPI 1: Income
+        self.kpi_income_card = theme.Card(self.exports_kpi_frame, width=200, height=90)
+        self.kpi_income_card.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        self.kpi_income_val = tk.Label(self.kpi_income_card, text="₹0.00", font=theme.FONT_SUBTITLE, fg=theme.INCOME, bg=theme.BG_CARD)
+        self.kpi_income_val.pack(pady=(12, 2))
+        self.kpi_income_sub = tk.Label(self.kpi_income_card, text="TOTAL INFLOW", font=theme.FONT_SMALL, fg=theme.TEXT_MUTED, bg=theme.BG_CARD)
+        self.kpi_income_sub.pack()
+
+        # KPI 2: Expenses
+        self.kpi_expense_card = theme.Card(self.exports_kpi_frame, width=200, height=90)
+        self.kpi_expense_card.grid(row=0, column=1, padx=4, sticky="ew")
+        self.kpi_expense_val = tk.Label(self.kpi_expense_card, text="₹0.00", font=theme.FONT_SUBTITLE, fg=theme.EXPENSE, bg=theme.BG_CARD)
+        self.kpi_expense_val.pack(pady=(12, 2))
+        self.kpi_expense_sub = tk.Label(self.kpi_expense_card, text="TOTAL OUTFLOW", font=theme.FONT_SMALL, fg=theme.TEXT_MUTED, bg=theme.BG_CARD)
+        self.kpi_expense_sub.pack()
+
+        # KPI 3: Net Savings
+        self.kpi_savings_card = theme.Card(self.exports_kpi_frame, width=200, height=90)
+        self.kpi_savings_card.grid(row=0, column=2, padx=4, sticky="ew")
+        self.kpi_savings_val = tk.Label(self.kpi_savings_card, text="₹0.00", font=theme.FONT_SUBTITLE, fg=theme.ACCENT, bg=theme.BG_CARD)
+        self.kpi_savings_val.pack(pady=(12, 2))
+        self.kpi_savings_sub = tk.Label(self.kpi_savings_card, text="NET SAVINGS (0%)", font=theme.FONT_SMALL, fg=theme.TEXT_MUTED, bg=theme.BG_CARD)
+        self.kpi_savings_sub.pack()
+
+        # KPI 4: Top Category
+        self.kpi_topcat_card = theme.Card(self.exports_kpi_frame, width=200, height=90)
+        self.kpi_topcat_card.grid(row=0, column=3, padx=(6, 0), sticky="ew")
+        self.kpi_topcat_val = tk.Label(self.kpi_topcat_card, text="None", font=theme.FONT_SUBTITLE, fg="#f59e0b", bg=theme.BG_CARD)
+        self.kpi_topcat_val.pack(pady=(12, 2))
+        self.kpi_topcat_sub = tk.Label(self.kpi_topcat_card, text="TOP CATEGORY", font=theme.FONT_SMALL, fg=theme.TEXT_MUTED, bg=theme.BG_CARD)
+        self.kpi_topcat_sub.pack()
+
+        # Main Layout: Left Column (Insights + Charts) and Right Column (Exports & Database Tools)
+        main_layout = tk.Frame(frame, bg=theme.BG_MAIN)
         main_layout.pack(fill="both", expand=True, padx=25, pady=5)
 
-        # Left panel for natural language insights
-        self.insights_card = theme.Card(main_layout, width=420, height=450)
-        self.insights_card.pack(side="left", fill="both", expand=True, padx=(0, 15))
-        
-        ins_title = tk.Label(self.insights_card, text="💡 AI Spending Insights (Pandas-Generated)", font=theme.FONT_SUBTITLE, fg=theme.TEXT_PRIMARY, bg=theme.BG_CARD)
-        ins_title.pack(pady=15, padx=20, anchor="w")
+        # Left Column
+        left_col = tk.Frame(main_layout, bg=theme.BG_MAIN)
+        left_col.pack(side="left", fill="both", expand=True, padx=(0, 15))
+
+        # Panel 1: AI Spending Insights Card
+        self.insights_card = theme.Card(left_col, width=540, height=300)
+        self.insights_card.pack(fill="x", pady=(0, 15))
+
+        ins_header_frame = tk.Frame(self.insights_card, bg=theme.BG_CARD)
+        ins_header_frame.pack(fill="x", padx=20, pady=(15, 8))
+
+        ins_title = tk.Label(ins_header_frame, text="💡 AI Spending Insights (Pandas-Generated)", font=theme.FONT_SUBTITLE, fg=theme.TEXT_PRIMARY, bg=theme.BG_CARD)
+        ins_title.pack(side="left")
 
         self.insights_container = tk.Frame(self.insights_card, bg=theme.BG_CARD)
-        self.insights_container.pack(fill="both", expand=True, padx=20, pady=10)
+        self.insights_container.pack(fill="both", expand=True, padx=20, pady=(0, 15))
 
-        # Right panel for PDF/CSV operations
-        export_card = theme.Card(main_layout, width=320, height=520)
-        export_card.pack(side="right", fill="y")
+        # Panel 2: Embedded Charts Card (Income vs Expense Trends & Category Breakdown)
+        self.exports_charts_card = theme.Card(left_col, width=540, height=330)
+        self.exports_charts_card.pack(fill="both", expand=True, pady=(0, 15))
+
+        chart_header_frame = tk.Frame(self.exports_charts_card, bg=theme.BG_CARD)
+        chart_header_frame.pack(fill="x", padx=20, pady=(15, 5))
+
+        chart_title = tk.Label(chart_header_frame, text="📈 Spending & Trend Analytics", font=theme.FONT_SUBTITLE, fg=theme.TEXT_PRIMARY, bg=theme.BG_CARD)
+        chart_title.pack(side="left")
+
+        self.exports_charts_container = tk.Frame(self.exports_charts_card, bg=theme.BG_CARD)
+        self.exports_charts_container.pack(fill="both", expand=True, padx=15, pady=(5, 15))
+
+        # Right Column (Database & Exports Card)
+        export_card = theme.Card(main_layout, width=320, height=660)
+        export_card.pack(side="right", fill="y", anchor="n")
         export_card.pack_propagate(False)
 
         exp_title = tk.Label(export_card, text="📦 Database & Exports", font=theme.FONT_SUBTITLE, fg=theme.TEXT_PRIMARY, bg=theme.BG_CARD)
@@ -1836,23 +2005,129 @@ class SmartBudgetTrackerApp(tk.Tk):
         return page
 
     def refresh_exports(self, df):
-        # Clear insights container
+        # 1. Update KPI Summary Cards
+        summary = analytics.get_monthly_summary(df)
+        cat_spending = analytics.get_category_wise_spending(df)
+        top_cat, top_amt = analytics.get_highest_expense_category(df)
+
+        if hasattr(self, "kpi_income_val"):
+            self.kpi_income_val.config(text=f"₹{summary['income']:,.0f}")
+            self.kpi_income_sub.config(text="TOTAL INFLOW (ACTIVE MONTH)")
+
+            self.kpi_expense_val.config(text=f"₹{summary['expense']:,.0f}")
+            self.kpi_expense_sub.config(text="TOTAL OUTFLOW (ACTIVE MONTH)")
+
+            self.kpi_savings_val.config(text=f"₹{summary['savings']:,.0f}")
+            self.kpi_savings_sub.config(text=f"NET SAVINGS ({summary['savings_rate']:.1f}%)")
+
+            if top_cat != "None" and summary["expense"] > 0:
+                pct = (top_amt / summary["expense"]) * 100
+                self.kpi_topcat_val.config(text=f"{top_cat}")
+                self.kpi_topcat_sub.config(text=f"₹{top_amt:,.0f} ({pct:.0f}% of total)")
+            else:
+                self.kpi_topcat_val.config(text="None")
+                self.kpi_topcat_sub.config(text="TOP EXPENSE CATEGORY")
+
+        # 2. Clear and populate insights container
         for child in self.insights_container.winfo_children():
             child.destroy()
 
-        # Load natural language spending insights
         insights_list = analytics.get_spending_insights(df)
 
+        def get_insight_icon(text):
+            lower = text.lower()
+            if "cash flow" in lower or "inflow" in lower or "saved" in lower:
+                return "💰"
+            if "top expense" in lower or "highest" in lower:
+                return "🏆"
+            if "daily" in lower:
+                return "📅"
+            if "mom" in lower or "trajectory" in lower or "increased" in lower or "decreased" in lower:
+                return "📈"
+            if "shift" in lower or "category" in lower:
+                return "🛒"
+            if "diversification" in lower or "focus" in lower or "discipline" in lower:
+                return "🎯"
+            return "💡"
+
         for ins in insights_list:
-            # Draw bullet-point line with border
-            bullet_frame = tk.Frame(self.insights_container, bg=theme.BG_CARD, pady=8)
+            bullet_frame = tk.Frame(self.insights_container, bg=theme.BG_CARD, pady=6)
             bullet_frame.pack(fill="x", anchor="w")
 
-            bullet = tk.Label(bullet_frame, text="• ", font=theme.FONT_SUBTITLE, fg=theme.ACCENT, bg=theme.BG_CARD)
-            bullet.pack(side="left", anchor="n")
+            icon = get_insight_icon(ins)
+            bullet = tk.Label(bullet_frame, text=icon, font=theme.FONT_SUBTITLE, bg=theme.BG_CARD)
+            bullet.pack(side="left", padx=(0, 10), anchor="n")
 
-            ins_lbl = tk.Label(bullet_frame, text=ins, font=theme.FONT_BODY, fg=theme.TEXT_PRIMARY, bg=theme.BG_CARD, justify="left", wraplength=480)
+            ins_lbl = tk.Label(
+                bullet_frame, 
+                text=ins, 
+                font=theme.FONT_BODY, 
+                fg=theme.TEXT_PRIMARY, 
+                bg=theme.BG_CARD, 
+                justify="left", 
+                wraplength=520
+            )
             ins_lbl.pack(side="left", fill="x", expand=True, anchor="w")
+
+        # 3. Render Matplotlib Analytics Charts
+        if hasattr(self, "exports_charts_container"):
+            for child in self.exports_charts_container.winfo_children():
+                child.destroy()
+
+            try:
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.6, 2.8), facecolor=theme.BG_CARD)
+                
+                # Chart 1: Multi-Month Income vs Expense Trend
+                trends = analytics.get_monthly_spending_trends(df, num_months=4)
+                months = trends.get("months", [])
+                incomes = trends.get("income", [])
+                expenses = trends.get("expense", [])
+
+                if months and (any(incomes) or any(expenses)):
+                    x = list(range(len(months)))
+                    bar_w = 0.35
+                    ax1.bar([i - bar_w/2 for i in x], incomes, bar_w, label='Income', color=theme.INCOME)
+                    ax1.bar([i + bar_w/2 for i in x], expenses, bar_w, label='Expense', color=theme.EXPENSE)
+                    ax1.set_xticks(x)
+                    ax1.set_xticklabels(months, color=theme.TEXT_PRIMARY, fontsize=8)
+                    ax1.tick_params(colors=theme.TEXT_MUTED, labelsize=7)
+                    ax1.yaxis.grid(True, linestyle='--', alpha=0.15, color='white')
+                    ax1.legend(facecolor=theme.BG_CARD, edgecolor=theme.BORDER, labelcolor=theme.TEXT_PRIMARY, fontsize=7)
+                    ax1.set_title("Monthly Income vs Expense Trend", color=theme.TEXT_PRIMARY, fontdict={'fontsize': 9, 'weight': 'bold'})
+                    for spine in ax1.spines.values():
+                        spine.set_color(theme.BORDER)
+                else:
+                    ax1.text(0.5, 0.5, 'No Trend Data Available', ha='center', va='center', color=theme.TEXT_MUTED, fontsize=8)
+                    ax1.axis('off')
+
+                # Chart 2: Category Spending Breakdown (Horizontal Bar)
+                if cat_spending:
+                    top_items = list(cat_spending.items())[:6]
+                    cats = [c[0] for c in reversed(top_items)]
+                    amts = [c[1] for c in reversed(top_items)]
+                    bar_colors = ['#10b981', '#3b82f6', '#f59e0b', '#ec4899', '#8b5cf6', '#14b8a6'][:len(cats)]
+                    
+                    y_pos = list(range(len(cats)))
+                    ax2.barh(y_pos, amts, color=bar_colors, height=0.55)
+                    ax2.set_yticks(y_pos)
+                    ax2.set_yticklabels(cats, color=theme.TEXT_PRIMARY, fontsize=8)
+                    ax2.tick_params(colors=theme.TEXT_MUTED, labelsize=7)
+                    ax2.xaxis.grid(True, linestyle='--', alpha=0.15, color='white')
+                    ax2.set_title("Top Spending Categories", color=theme.TEXT_PRIMARY, fontdict={'fontsize': 9, 'weight': 'bold'})
+                    for spine in ax2.spines.values():
+                        spine.set_color(theme.BORDER)
+                else:
+                    ax2.text(0.5, 0.5, 'No Category Spending Data', ha='center', va='center', color=theme.TEXT_MUTED, fontsize=8)
+                    ax2.axis('off')
+
+                fig.tight_layout()
+                canvas = FigureCanvasTkAgg(fig, master=self.exports_charts_container)
+                canvas.draw()
+                canvas.get_tk_widget().pack(fill="both", expand=True)
+                plt.close(fig)
+            except Exception as e:
+                lbl = tk.Label(self.exports_charts_container, text=f"Unable to render charts: {str(e)}", font=theme.FONT_SMALL, fg=theme.TEXT_MUTED, bg=theme.BG_CARD)
+                lbl.pack(expand=True)
 
     def export_pdf_report(self):
         transactions = self.tracker.get_transactions()
@@ -1862,17 +2137,38 @@ class SmartBudgetTrackerApp(tk.Tk):
             messagebox.showwarning("Warning", "Cannot generate report: No transactions found in database.")
             return
 
+        personal_df = df[df["profile"] == "Personal"] if "profile" in df.columns else df
+        if personal_df.empty:
+            messagebox.showwarning("Warning", "Cannot generate report: No personal transactions found.")
+            return
+
         today = date.today()
-        summary = analytics.get_monthly_summary(df, today.year, today.month)
-        cat_spending = analytics.get_category_wise_spending(df, today.year, today.month)
+        month_df = personal_df[(personal_df["year"] == today.year) & (personal_df["month"] == today.month)]
+        if month_df.empty:
+            latest_date = personal_df["date"].max()
+            rep_yr, rep_mo = (latest_date.year, latest_date.month) if pd.notna(latest_date) else (today.year, today.month)
+        else:
+            rep_yr, rep_mo = today.year, today.month
+
+        summary = analytics.get_monthly_summary(df, rep_yr, rep_mo)
+        cat_spending = analytics.get_category_wise_spending(df, rep_yr, rep_mo)
         goals = self.tracker.get_goals()
         subs = self.tracker.get_subscriptions()
         health = analytics.calculate_health_score(df, self.tracker.budget_limit, goals, subs)
 
-        report_filename = f"finance_report_{today.strftime('%b_%Y')}.pdf"
+        month_label = date(rep_yr, rep_mo, 1).strftime('%b_%Y')
+        default_filename = f"finance_report_{month_label}.pdf"
         
+        file_path = filedialog.asksaveasfilename(
+            title="Save Monthly PDF Report",
+            defaultextension=".pdf",
+            initialfile=default_filename,
+            filetypes=[("PDF Documents", "*.pdf"), ("All Files", "*.*")]
+        )
+        if not file_path:
+            return
+
         try:
-            # Filter transactions to only pass Personal ones to PDF report
             personal_txs = [t for t in transactions if t.profile == "Personal"]
             PDFReportGenerator.generate_report(
                 personal_txs, 
@@ -1880,16 +2176,16 @@ class SmartBudgetTrackerApp(tk.Tk):
                 cat_spending, 
                 health, 
                 goals, 
-                file_path=report_filename
+                file_path=file_path
             )
-            # Create a full path link
-            full_path = os.path.abspath(report_filename)
-            
-            # Automatically open the generated PDF
+            full_path = os.path.abspath(file_path)
+            messagebox.showinfo("Export Success", f"Monthly PDF report generated successfully!\n\nSaved to: {full_path}")
             try:
                 os.startfile(full_path)
             except Exception:
                 pass
+        except PermissionError:
+            messagebox.showerror("Export Failed", f"Permission denied writing to '{file_path}'.\n\nThe file may be open in another application. Please close it and try again.")
         except Exception as e:
             messagebox.showerror("Export Failed", f"An error occurred while compiling the PDF: {str(e)}")
 
@@ -1897,7 +2193,6 @@ class SmartBudgetTrackerApp(tk.Tk):
         transactions = self.tracker.get_transactions()
         df = analytics.load_dataframe(transactions)
 
-        # Filter for Personal transactions only
         if "profile" in df.columns:
             df = df[df["profile"] == "Personal"]
 
@@ -1905,21 +2200,41 @@ class SmartBudgetTrackerApp(tk.Tk):
             messagebox.showwarning("Warning", "No transaction ledger available to export.")
             return
 
-        csv_filename = "transactions_export.csv"
+        today_str = date.today().strftime('%Y%m%d')
+        default_filename = f"transactions_export_{today_str}.csv"
+        
+        file_path = filedialog.asksaveasfilename(
+            title="Export Ledger to CSV",
+            defaultextension=".csv",
+            initialfile=default_filename,
+            filetypes=[("CSV Spreadsheets", "*.csv"), ("All Files", "*.*")]
+        )
+        if not file_path:
+            return
+
         try:
-            # Export structured pandas dataframe to csv
-            # We select clean columns to present in Excel
             clean_df = df[["date", "type", "category", "amount", "notes"]].copy()
             clean_df.columns = ["Date", "Type", "Category", "Amount (INR)", "Notes / Description"]
             
-            clean_df.to_csv(csv_filename, index=False)
-            full_path = os.path.abspath(csv_filename)
-            
-            # Automatically open the generated CSV in Excel
+            # Mitigate CSV Formula Injection (DDE attack protection for spreadsheet viewers)
+            def sanitize_csv_cell(val):
+                if isinstance(val, str) and val.startswith(('=', '+', '-', '@', '\t', '\r')):
+                    return f"'{val}"
+                return val
+
+            for col in ["Type", "Category", "Notes / Description"]:
+                if col in clean_df.columns:
+                    clean_df[col] = clean_df[col].apply(sanitize_csv_cell)
+
+            clean_df.to_csv(file_path, index=False)
+            full_path = os.path.abspath(file_path)
+            messagebox.showinfo("Export Success", f"Ledger exported to CSV successfully!\n\nSaved to: {full_path}")
             try:
                 os.startfile(full_path)
             except Exception:
                 pass
+        except PermissionError:
+            messagebox.showerror("Export Failed", f"Permission denied writing to '{file_path}'.\n\nThe file may be open in Excel. Please close it and try again.")
         except Exception as e:
             messagebox.showerror("Export Failed", f"An error occurred during CSV export: {str(e)}")
 
@@ -1932,17 +2247,17 @@ class SmartBudgetTrackerApp(tk.Tk):
         )
         if ans:
             try:
-                # 1. Create fail-safe automatic backup in backups folder before wiping
-                os.makedirs("backups", exist_ok=True)
+                db_path = self.tracker.db.db_name
+                backup_dir = os.path.join(os.path.dirname(db_path), "backups")
+                os.makedirs(backup_dir, exist_ok=True)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup_path = f"backups/auto_backup_before_reset_{timestamp}.db"
+                backup_path = os.path.join(backup_dir, f"auto_backup_before_reset_{timestamp}.db")
                 try:
-                    shutil.copy("finance_assistant.db", backup_path)
+                    shutil.copy(db_path, backup_path)
                     backup_msg = f"\n\n(A safety backup was saved automatically to: {backup_path})"
                 except Exception:
                     backup_msg = ""
 
-                # 2. Wipe SQLite tables
                 conn = self.tracker.db.get_connection()
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM transactions")
@@ -1951,74 +2266,87 @@ class SmartBudgetTrackerApp(tk.Tk):
                 conn.commit()
                 conn.close()
                 
-                # Set settings.json 'seeded' flag to True to prevent re-seeding
                 import json
+                settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
                 settings = {}
-                if os.path.exists("settings.json"):
+                if os.path.exists(settings_file):
                     try:
-                        with open("settings.json", "r") as f:
+                        with open(settings_file, "r") as f:
                             settings = json.load(f)
                     except Exception:
                         pass
                 settings["seeded"] = True
                 try:
-                    with open("settings.json", "w") as f:
+                    with open(settings_file, "w") as f:
                         json.dump(settings, f)
                 except Exception:
                     pass
                 
                 messagebox.showinfo("Success", f"All data has been cleared! The application is now ready for your personal use.{backup_msg}")
-                self.refresh_page_data(self.current_page)
+                self.refresh_page_data("exports")
+                if self.current_page != "exports":
+                    self.refresh_page_data(self.current_page)
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to reset database: {str(e)}")
 
     def backup_database(self):
         try:
-            # Check if active database exists
-            if not os.path.exists("finance_assistant.db"):
-                messagebox.showerror("Error", "No database found to backup.")
+            db_path = self.tracker.db.db_name
+            if not os.path.exists(db_path):
+                messagebox.showerror("Error", f"No database found to backup at: {db_path}")
                 return
                 
-            # Create backups folder if missing
-            os.makedirs("backups", exist_ok=True)
-            backup_path = "backups/quick_backup.db"
+            backup_dir = os.path.join(os.path.dirname(db_path), "backups")
+            os.makedirs(backup_dir, exist_ok=True)
+            backup_path = os.path.join(backup_dir, "quick_backup.db")
             
-            # Direct copy
-            shutil.copy("finance_assistant.db", backup_path)
-            messagebox.showinfo("Backup Success", "Quick backup created successfully!\n\nYour data has been saved to 'backups/quick_backup.db'.")
+            shutil.copy(db_path, backup_path)
+            messagebox.showinfo("Backup Success", f"Quick backup created successfully!\n\nSaved to: {backup_path}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create backup: {str(e)}")
 
     def restore_database(self):
-        backup_path = "backups/quick_backup.db"
+        db_path = self.tracker.db.db_name
+        backup_dir = os.path.join(os.path.dirname(db_path), "backups")
+        backup_path = os.path.join(backup_dir, "quick_backup.db")
         if not os.path.exists(backup_path):
-            messagebox.showwarning("Restore Failed", "No quick backup found!\n\nPlease click 'Backup Financial Database' to save your current data first.")
+            messagebox.showwarning("Restore Failed", f"No quick backup found at:\n{backup_path}\n\nPlease click 'Backup Financial Database' to save a backup first.")
+            return
+
+        # Validate backup file integrity before restore
+        is_valid, err_msg = DatabaseManager.validate_sqlite_db_file(backup_path)
+        if not is_valid:
+            messagebox.showerror("Corrupt Backup", f"Cannot restore: The backup file is invalid or corrupted.\n\nDetails: {err_msg}")
             return
 
         ans = messagebox.askyesno(
             "⚠️ Restore Database Backup",
-            "Are you sure you want to restore the quick backup?\n\nThis will overwrite all current transactions, goals, and subscriptions with your previously backed up data.",
+            "Are you sure you want to restore the quick backup?\n\nThis will overwrite all current transactions, goals, and subscriptions with your previously backed up data.\n\nA safety backup of your current active database will be saved automatically before restoring.",
             icon="warning"
         )
         if ans:
             try:
-                # Overwrite active database file
-                shutil.copy(backup_path, "finance_assistant.db")
-                
-                # Re-initialize SQL schemas (in case restoring from an older version schema)
+                # Create automatic safety backup before restoring
+                os.makedirs(backup_dir, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                safety_backup_path = os.path.join(backup_dir, f"auto_backup_before_restore_{timestamp}.db")
+                if os.path.exists(db_path):
+                    shutil.copy(db_path, safety_backup_path)
+
+                shutil.copy(backup_path, db_path)
                 self.tracker.db.init_db()
-                
-                # Force refresh data across all pages
-                self.refresh_page_data(self.current_page)
-                
-                messagebox.showinfo("Success", "Database backup restored successfully! All your previous data is now visible on the dashboard.")
+                self.refresh_page_data("exports")
+                if self.current_page != "exports":
+                    self.refresh_page_data(self.current_page)
+                messagebox.showinfo("Success", f"Database backup restored successfully! All your previous data is now visible.\n\n(A safety backup of your prior data was saved to: {safety_backup_path})")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to restore backup: {str(e)}")
 
     def export_database_file(self):
         try:
-            if not os.path.exists("finance_assistant.db"):
-                messagebox.showerror("Error", "No database found to export.")
+            db_path = self.tracker.db.db_name
+            if not os.path.exists(db_path):
+                messagebox.showerror("Error", f"No database found to export at: {db_path}")
                 return
                 
             today_str = datetime.now().strftime("%Y%m%d")
@@ -2030,32 +2358,49 @@ class SmartBudgetTrackerApp(tk.Tk):
             )
             
             if file_path:
-                shutil.copy("finance_assistant.db", file_path)
+                shutil.copy(db_path, file_path)
                 messagebox.showinfo("Export Success", f"Database backup file exported successfully to:\n{file_path}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export backup: {str(e)}")
 
     def import_database_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Select Database File to Import",
+            filetypes=[("Database Files", "*.db"), ("SQLite Files", "*.sqlite*"), ("All Files", "*.*")]
+        )
+        if not file_path:
+            return
+
+        # Validate database file integrity before touching active database
+        is_valid, err_msg = DatabaseManager.validate_sqlite_db_file(file_path)
+        if not is_valid:
+            messagebox.showerror("Invalid Database File", f"The selected file cannot be imported because it is not a valid SQLite database.\n\nDetails: {err_msg}")
+            return
+
         ans = messagebox.askyesno(
             "⚠️ Import Database Backup",
-            "Importing a database file will overwrite all your current transactions, goals, and subscriptions.\n\n"
+            "Importing this database file will overwrite all your current transactions, goals, and subscriptions.\n\n"
+            "A safety backup of your current active database will be saved automatically before importing.\n\n"
             "Do you want to proceed?",
             icon="warning"
         )
         if ans:
             try:
-                file_path = filedialog.askopenfilename(
-                    title="Select Database File to Import",
-                    filetypes=[("Database Files", "*.db"), ("All Files", "*.*")]
-                )
+                db_path = self.tracker.db.db_name
+                backup_dir = os.path.join(os.path.dirname(db_path), "backups")
+                os.makedirs(backup_dir, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                safety_backup_path = os.path.join(backup_dir, f"auto_backup_before_import_{timestamp}.db")
+                if os.path.exists(db_path):
+                    shutil.copy(db_path, safety_backup_path)
+
+                shutil.copy(file_path, db_path)
+                self.tracker.db.init_db()
                 
-                if file_path:
-                    shutil.copy(file_path, "finance_assistant.db")
-                    self.tracker.db.init_db()
-                    
-                    # Force refresh UI data across all pages
+                self.refresh_page_data("exports")
+                if self.current_page != "exports":
                     self.refresh_page_data(self.current_page)
-                    messagebox.showinfo("Import Success", "Database backup imported successfully! All your previous data has loaded.")
+                messagebox.showinfo("Import Success", f"Database backup imported successfully! All your previous data has loaded.\n\n(A safety backup of your prior data was saved to: {safety_backup_path})")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to import backup: {str(e)}")
 
@@ -2063,34 +2408,42 @@ class SmartBudgetTrackerApp(tk.Tk):
         ans = messagebox.askyesno(
             "🌱 Load Demo / Sample Data",
             "Are you sure you want to load the sample demo transactions, goals, and subscriptions?\n\n"
-            "This will add realistic sample data for you to test the app features.",
+            "This will seed multi-month demo data to demonstrate all analytics, insights, and charts.",
             icon="info"
         )
         if ans:
             try:
-                # Force settings.json seeded status to false temporarily to allow seeding
+                import main
+                main.seed_sample_data(self.tracker.db, force=True)
+                
                 import json
+                settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
                 settings = {}
-                if os.path.exists("settings.json"):
+                if os.path.exists(settings_file):
                     try:
-                        with open("settings.json", "r") as f:
+                        with open(settings_file, "r") as f:
                             settings = json.load(f)
                     except Exception:
                         pass
-                settings["seeded"] = False
-                with open("settings.json", "w") as f:
-                    json.dump(settings, f)
+                settings["seeded"] = True
+                try:
+                    with open(settings_file, "w") as f:
+                        json.dump(settings, f)
+                except Exception:
+                    pass
                 
-                # Run the seeding engine
-                import main
-                main.seed_sample_data(self.tracker.db)
+                # Automatically refresh analytics and exports without restarting application
+                self.refresh_page_data("exports")
+                if self.current_page != "exports":
+                    self.refresh_page_data(self.current_page)
                 
-                # Refresh current view
-                self.refresh_page_data(self.current_page)
-                messagebox.showinfo("Success", "Demo data loaded successfully! The dashboard and ledger have been updated.")
+                messagebox.showinfo(
+                    "Success", 
+                    "Demo data loaded successfully!\n\n"
+                    "The AI Spending Insights, summary metrics, and analytics charts have been automatically updated."
+                )
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load demo data: {str(e)}")
-
     def create_ai_insights_page(self):
         return gui_ai_view.create_ai_insights_page(self)
 
@@ -2253,7 +2606,8 @@ class SmartBudgetTrackerApp(tk.Tk):
                 ("subscriptions", "⏰ Subscriptions"),
                 ("suggestions", "💡 Smart Suggestions"),
                 ("exports", "📈 Insights & Exports"),
-                ("ai_insights", "⚡ Insight Engine")
+                ("ai_insights", "⚡ Insight Engine"),
+                ("excel_import", "📥 Excel Import & Insights")
             ]
         else: # Business
             header_lbl = tk.Label(
@@ -2277,7 +2631,8 @@ class SmartBudgetTrackerApp(tk.Tk):
                 ("biz_gst", "🧮 GST Calculator"),
                 ("biz_cashflow", "🌊 Cash Flow"),
                 ("biz_payroll", "👥 Employee Payroll"),
-                ("biz_invoice", "🧾 Invoice Generator")
+                ("biz_invoice", "🧾 Invoice Generator"),
+                ("biz_excel_import", "📥 ERP Excel Import & Insights")
             ]
             
         self.nav_buttons = {}
@@ -2321,6 +2676,8 @@ class SmartBudgetTrackerApp(tk.Tk):
             self.refresh_biz_cashflow()
         elif page_name == "biz_payroll":
             self.refresh_biz_payroll()
+        elif page_name == "biz_excel_import":
+            gui_biz_excel_view.refresh_biz_excel_import_page(self)
 
     # ==========================================
     # --- BUSINESS MODULES ---
@@ -2488,6 +2845,19 @@ class SmartBudgetTrackerApp(tk.Tk):
         top_bar = tk.Frame(frame, bg=theme.BG_MAIN)
         top_bar.pack(fill="x", padx=20, pady=15)
         tk.Label(top_bar, text="Daily Sales Entry Ledger", font=theme.FONT_TITLE, fg=theme.TEXT_PRIMARY, bg=theme.BG_MAIN).pack(side="left")
+
+        tk.Button(
+            top_bar,
+            text="📥 Import Excel Sales",
+            font=theme.FONT_SMALL,
+            bg=theme.INCOME,
+            fg=theme.TEXT_DARK,
+            bd=0,
+            padx=12,
+            pady=5,
+            cursor="hand2",
+            command=lambda: [self.switch_page("biz_excel_import"), hasattr(self, "biz_entity_var") and self.biz_entity_var.set("Sales")]
+        ).pack(side="right", padx=10)
         
         # Today's Sales Banner
         self.biz_today_sales_lbl = tk.Label(top_bar, text="Today's Sales = ₹0.00", font=theme.FONT_SUBTITLE, fg=theme.INCOME, bg=theme.BG_MAIN)
@@ -2538,7 +2908,7 @@ class SmartBudgetTrackerApp(tk.Tk):
         t_box.pack(fill="both", expand=True, padx=20, pady=15)
         
         scroll_y = ttk.Scrollbar(t_box, orient="vertical")
-        columns = ("id", "date", "customer", "invoice", "amount", "method")
+        columns = ("id", "date", "customer", "invoice", "amount", "method", "source")
         self.sales_tree = ttk.Treeview(t_box, columns=columns, show="headings", yscrollcommand=scroll_y.set, style="Custom.Treeview", height=12)
         scroll_y.config(command=self.sales_tree.yview)
         scroll_y.pack(side="right", fill="y")
@@ -2549,13 +2919,15 @@ class SmartBudgetTrackerApp(tk.Tk):
         self.sales_tree.heading("invoice", text="Invoice No")
         self.sales_tree.heading("amount", text="Amount")
         self.sales_tree.heading("method", text="Payment Method")
+        self.sales_tree.heading("source", text="Source")
         
         self.sales_tree.column("id", width=40, anchor="center")
         self.sales_tree.column("date", width=90, anchor="center")
-        self.sales_tree.column("customer", width=160, anchor="w")
-        self.sales_tree.column("invoice", width=95, anchor="center")
-        self.sales_tree.column("amount", width=100, anchor="e")
-        self.sales_tree.column("method", width=110, anchor="center")
+        self.sales_tree.column("customer", width=150, anchor="w")
+        self.sales_tree.column("invoice", width=90, anchor="center")
+        self.sales_tree.column("amount", width=95, anchor="e")
+        self.sales_tree.column("method", width=100, anchor="center")
+        self.sales_tree.column("source", width=85, anchor="center")
         
         self.sales_tree.pack(fill="both", expand=True, padx=5, pady=5)
         
@@ -2609,6 +2981,19 @@ class SmartBudgetTrackerApp(tk.Tk):
         top_bar = tk.Frame(frame, bg=theme.BG_MAIN)
         top_bar.pack(fill="x", padx=20, pady=15)
         tk.Label(top_bar, text="Business Expenses Entry Ledger", font=theme.FONT_TITLE, fg=theme.TEXT_PRIMARY, bg=theme.BG_MAIN).pack(side="left")
+
+        tk.Button(
+            top_bar,
+            text="📥 Import Excel Expenses",
+            font=theme.FONT_SMALL,
+            bg=theme.EXPENSE,
+            fg=theme.TEXT_PRIMARY,
+            bd=0,
+            padx=12,
+            pady=5,
+            cursor="hand2",
+            command=lambda: [self.switch_page("biz_excel_import"), hasattr(self, "biz_entity_var") and self.biz_entity_var.set("Expenses")]
+        ).pack(side="right", padx=10)
         
         # Entry Grid
         entry_box = tk.Frame(frame, bg=theme.BG_CARD, highlightbackground=theme.BORDER, highlightthickness=1)
@@ -2649,7 +3034,7 @@ class SmartBudgetTrackerApp(tk.Tk):
         t_box.pack(fill="both", expand=True, padx=20, pady=15)
         
         scroll_y = ttk.Scrollbar(t_box, orient="vertical")
-        columns = ("id", "date", "category", "amount", "notes")
+        columns = ("id", "date", "category", "amount", "notes", "source")
         self.exp_tree = ttk.Treeview(t_box, columns=columns, show="headings", yscrollcommand=scroll_y.set, style="Custom.Treeview", height=12)
         scroll_y.config(command=self.exp_tree.yview)
         scroll_y.pack(side="right", fill="y")
@@ -2659,12 +3044,14 @@ class SmartBudgetTrackerApp(tk.Tk):
         self.exp_tree.heading("category", text="Category")
         self.exp_tree.heading("amount", text="Amount")
         self.exp_tree.heading("notes", text="Notes")
+        self.exp_tree.heading("source", text="Source")
         
         self.exp_tree.column("id", width=40, anchor="center")
         self.exp_tree.column("date", width=95, anchor="center")
-        self.exp_tree.column("category", width=140, anchor="w")
-        self.exp_tree.column("amount", width=105, anchor="e")
-        self.exp_tree.column("notes", width=250, anchor="w")
+        self.exp_tree.column("category", width=135, anchor="w")
+        self.exp_tree.column("amount", width=100, anchor="e")
+        self.exp_tree.column("notes", width=210, anchor="w")
+        self.exp_tree.column("source", width=85, anchor="center")
         
         self.exp_tree.pack(fill="both", expand=True, padx=5, pady=5)
         
@@ -2741,6 +3128,19 @@ class SmartBudgetTrackerApp(tk.Tk):
         top_bar = tk.Frame(frame, bg=theme.BG_MAIN)
         top_bar.pack(fill="x", padx=20, pady=15)
         tk.Label(top_bar, text="Business Inventory Tracker", font=theme.FONT_TITLE, fg=theme.TEXT_PRIMARY, bg=theme.BG_MAIN).pack(side="left")
+
+        tk.Button(
+            top_bar,
+            text="📥 Import Excel Inventory",
+            font=theme.FONT_SMALL,
+            bg=theme.ACCENT,
+            fg=theme.TEXT_DARK,
+            bd=0,
+            padx=12,
+            pady=5,
+            cursor="hand2",
+            command=lambda: [self.switch_page("biz_excel_import"), hasattr(self, "biz_entity_var") and self.biz_entity_var.set("Inventory")]
+        ).pack(side="right", padx=10)
         
         # Alert Box
         self.biz_alert_frame = tk.Frame(frame, bg=theme.BG_MAIN)
@@ -2769,7 +3169,7 @@ class SmartBudgetTrackerApp(tk.Tk):
         t_box.pack(fill="both", expand=True, padx=20, pady=15)
         
         scroll_y = ttk.Scrollbar(t_box, orient="vertical")
-        columns = ("id", "name", "stock", "sold", "remaining")
+        columns = ("id", "name", "stock", "sold", "remaining", "source")
         self.inv_tree = ttk.Treeview(t_box, columns=columns, show="headings", yscrollcommand=scroll_y.set, style="Custom.Treeview", height=12)
         scroll_y.config(command=self.inv_tree.yview)
         scroll_y.pack(side="right", fill="y")
@@ -2779,12 +3179,14 @@ class SmartBudgetTrackerApp(tk.Tk):
         self.inv_tree.heading("stock", text="Total Stock")
         self.inv_tree.heading("sold", text="Sold")
         self.inv_tree.heading("remaining", text="Remaining")
+        self.inv_tree.heading("source", text="Source")
         
         self.inv_tree.column("id", width=40, anchor="center")
-        self.inv_tree.column("name", width=220, anchor="w")
-        self.inv_tree.column("stock", width=95, anchor="center")
-        self.inv_tree.column("sold", width=95, anchor="center")
-        self.inv_tree.column("remaining", width=95, anchor="center")
+        self.inv_tree.column("name", width=210, anchor="w")
+        self.inv_tree.column("stock", width=90, anchor="center")
+        self.inv_tree.column("sold", width=90, anchor="center")
+        self.inv_tree.column("remaining", width=90, anchor="center")
+        self.inv_tree.column("source", width=85, anchor="center")
         
         self.inv_tree.pack(fill="both", expand=True, padx=5, pady=5)
         
@@ -3633,18 +4035,42 @@ class SmartBudgetTrackerApp(tk.Tk):
             ax1.axis("off")
             
         if not expenses_df.empty:
-            cat_sums = expenses_df.groupby("category")["amount"].sum()
-            categories = list(cat_sums.index)
-            amounts = list(cat_sums.values)
-            
-            colors_list = ['#10b981', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#6b7280']
+            cat_sums = expenses_df.groupby("category")["amount"].sum().sort_values(ascending=False)
+            total_biz_spending = float(cat_sums.sum())
+            sorted_biz_cats = list(cat_sums.items())
+
+            can_keep_all = len(sorted_biz_cats) <= 6 and all((amt / total_biz_spending * 100) >= 5.0 for _, amt in sorted_biz_cats)
+
+            if can_keep_all:
+                categories = [c for c, _ in sorted_biz_cats]
+                amounts = [a for _, a in sorted_biz_cats]
+            else:
+                categories = []
+                amounts = []
+                others_amt = 0.0
+                for i, (cat, amt) in enumerate(sorted_biz_cats):
+                    pct = (amt / total_biz_spending) * 100 if total_biz_spending > 0 else 0
+                    if i < 5 and pct >= 5.0:
+                        categories.append(cat)
+                        amounts.append(amt)
+                    else:
+                        others_amt += amt
+                if others_amt > 0:
+                    categories.append("Others")
+                    amounts.append(others_amt)
+
+            formatted_labels = [c[:18] + ".." if len(c) > 20 else c for c in categories]
+            colors_list = ['#10b981', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#64748b']
             ax2.pie(
                 amounts,
-                labels=categories,
-                autopct='%1.0f%%',
+                labels=formatted_labels,
+                autopct=lambda pct: f'{pct:.0f}%' if pct >= 4 else '',
                 startangle=140,
-                colors=colors_list[:len(categories)],
-                textprops={'fontsize': 6, 'color': theme.TEXT_PRIMARY}
+                colors=colors_list[:len(amounts)],
+                textprops={'fontsize': 7, 'color': theme.TEXT_PRIMARY},
+                pctdistance=0.68,
+                radius=0.9,
+                wedgeprops=dict(edgecolor=theme.BG_CARD, linewidth=1.5)
             )
             ax2.set_title("Expense Distribution", color=theme.TEXT_PRIMARY, fontsize=9, fontweight="bold")
             ax2.set_facecolor(theme.BG_CARD)
@@ -3719,13 +4145,15 @@ class SmartBudgetTrackerApp(tk.Tk):
             self.sales_tree.delete(item)
             
         # 2. Fetch from DB
-        sales = self.tracker.db.get_all_business_sales()
+        sales = self.tracker.db.get_all_business_sales(include_meta=True)
         
         # 3. Populate
         today_total = 0.0
         today_str = date.today().strftime("%Y-%m-%d")
         for s in sales:
-            self.sales_tree.insert("", "end", values=(s[0], s[1], s[2], s[3] if s[3] else "-", f"₹{s[4]:,.2f}", s[5]))
+            source_tag = s[7] if len(s) > 7 and s[7] else ("Imported" if len(s) > 6 and s[6] else "Manual")
+            source_disp = "📥 Excel" if "Imported" in source_tag else "✍️ Manual"
+            self.sales_tree.insert("", "end", values=(s[0], s[1], s[2], s[3] if s[3] else "-", f"₹{s[4]:,.2f}", s[5], source_disp))
             if s[1] == today_str:
                 today_total += s[4]
                 
@@ -3736,9 +4164,11 @@ class SmartBudgetTrackerApp(tk.Tk):
         for item in self.exp_tree.get_children():
             self.exp_tree.delete(item)
             
-        expenses = self.tracker.db.get_all_business_expenses()
+        expenses = self.tracker.db.get_all_business_expenses(include_meta=True)
         for e in expenses:
-            self.exp_tree.insert("", "end", values=(e[0], e[1], e[2], f"₹{e[3]:,.2f}", e[4] if e[4] else "-"))
+            source_tag = e[6] if len(e) > 6 and e[6] else ("Imported" if len(e) > 5 and e[5] else "Manual")
+            source_disp = "📥 Excel" if "Imported" in source_tag else "✍️ Manual"
+            self.exp_tree.insert("", "end", values=(e[0], e[1], e[2], f"₹{e[3]:,.2f}", e[4] if e[4] else "-", source_disp))
 
     def refresh_biz_pl(self):
         # Fetch stats
@@ -3845,12 +4275,14 @@ class SmartBudgetTrackerApp(tk.Tk):
             self.inv_tree.delete(item)
             
         # 2. Fetch inventory
-        items = self.tracker.db.get_all_inventory()
+        items = self.tracker.db.get_all_inventory(include_meta=True)
         
         alerts = []
         for i in items:
             rem = i[2] - i[3]
-            self.inv_tree.insert("", "end", values=(i[0], i[1], i[2], i[3], rem))
+            source_tag = i[5] if len(i) > 5 and i[5] else ("Imported" if len(i) > 4 and i[4] else "Manual")
+            source_disp = "📥 Excel" if "Imported" in source_tag else "✍️ Manual"
+            self.inv_tree.insert("", "end", values=(i[0], i[1], i[2], i[3], rem, source_disp))
             if rem < 5:
                 alerts.append(f"⚠️ Restock Alert: {i[1]} has only {rem} units left in stock!")
                 

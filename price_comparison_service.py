@@ -1,12 +1,16 @@
+# -*- coding: utf-8 -*-
 """
 price_comparison_service.py
 ===========================
 Modular Price Comparison Service for FINSIGHT.
 
 Features:
-- Independent search across 4 platforms: Amazon India, Flipkart, Croma, Reliance Digital.
+- Independent search across supported platforms: Amazon India and Flipkart.
+- Intelligent semantic query relevance & model matching (eliminates irrelevant products & sponsored ads).
+- Advanced accessory & replacement-part filtering (rejects 'compatible with', cases, covers, OLED screens;
+  safely preserves genuine products like smartwatches with aluminium cases/sport bands).
+- Robust price normalization (excludes EMI rates, discounts, cashback, and rating digits).
 - Honest verification status (Verified vs Could Not Verify due to anti-bot / SPA constraints).
-- Real price normalization and variant/accessory filtering (no hardcoding, no fabricated data).
 - Dynamic best deal selection supporting:
     * Case A: One or more verified offers below user budget (shows lowest verified price + savings).
     * Case B: All verified offers above user budget (shows cheapest available option + excess amount).
@@ -17,17 +21,35 @@ Features:
 """
 
 import os
+import sys
 import re
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
-import requests
-from bs4 import BeautifulSoup
+import concurrent.futures
 
-# Standard user-agents for legitimate browser-like requests
+# Automatically ensure local .venv site-packages is in sys.path
+_venv_site = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "Lib", "site-packages")
+if os.path.exists(_venv_site) and _venv_site not in sys.path:
+    sys.path.insert(0, _venv_site)
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
+
+
+# Standard modern user-agents with proper client-hints to avoid Akamai/anti-bot interstitials
 BROWSER_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     'Accept-Language': 'en-IN,en;q=0.9',
     'DNT': '1',
@@ -35,19 +57,82 @@ BROWSER_HEADERS = {
     'Upgrade-Insecure-Requests': '1',
 }
 
+AMAZON_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'Accept-Language': 'en-IN,en;q=0.9,en-US;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'DNT': '1',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Sec-Ch-Ua': '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+}
+
+AMAZON_ALT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'DNT': '1',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+}
+
 FLIPKART_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
     'Accept-Language': 'en-IN,en;q=0.9',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
 }
 
+# Major known brands and associated product families to prevent cross-brand sponsored ad pollution
+KNOWN_BRANDS = {
+    'apple': {'iphone', 'ipad', 'macbook', 'airpods'},
+    'samsung': {'galaxy'},
+    'oneplus': set(),
+    'sony': set(),
+    'google': {'pixel'},
+    'xiaomi': {'redmi', 'poco'},
+    'motorola': {'moto'},
+    'vivo': {'iqoo'},
+    'oppo': {'realme'},
+    'boat': set(),
+    'noise': set(),
+    'dell': set(),
+    'hp': set(),
+    'lenovo': {'thinkpad'},
+    'asus': {'rog'},
+    'acer': set()
+}
+
+# Explicit accessory phrases that strongly signify an accessory or third-party replacement
+ACCESSORY_PHRASES = [
+    r'\b(?:compatible\s+with|designed\s+for|suitable\s+for|replacement\s+for|fits?)\b',
+    r'\b(?:case\s+cover|back\s+cover|flip\s+cover|silicone\s+case|protective\s+case|phone\s+case|clear\s+case|leather\s+case)\b',
+    r'\b(?:tempered\s+glass|screen\s+protector|screen\s+guard|lens\s+protector|camera\s+protector)\b',
+    r'\b(?:replacement\s+screen|oled\s+screen|lcd\s+screen|touch\s+screen\s+digitizer|display\s+combo)\b',
+    r'\b(?:charging\s+cable|usb\s+cable|type-c\s+cable|lightning\s+cable|fast\s+charging\s+cable)\b',
+    r'\b(?:ear\s*tips|ear\s*pads|ear\s*cushions|replacement\s+cushions)\b',
+    r'\b(?:skin\s+wrap|sticker\s+skin|body\s+skin)\b',
+    r'\b(?:replacement\s+strap|replacement\s+band|watch\s+strap|watch\s+band)\b',
+]
+
+# Baseline accessory keywords for query intent detection
 ACCESSORY_KEYWORDS = {
     'case', 'cover', 'glass', 'tempered glass', 'screen protector', 'screen guard',
     'cable', 'charger', 'adapter', 'skin', 'strap', 'band', 'pouch', 'sleeve',
-    'replacement screen', 'digitizer', 'back cover', 'mount', 'stand', 'remote control'
+    'replacement screen', 'digitizer', 'back cover', 'mount', 'stand', 'remote control',
+    'cushion', 'ear tips'
 }
 
-PLATFORMS = ["Amazon India", "Flipkart", "Croma", "Reliance Digital"]
+PLATFORMS = ["Amazon India", "Flipkart"]
 
 
 @dataclass
@@ -96,13 +181,15 @@ class ComparisonResult:
 
 
 # =========================================================================
-# --- HELPER FUNCTIONS: NORMALIZATION & VARIANT MATCHING ---
+# --- HELPER FUNCTIONS: NORMALIZATION, RELEVANCE & VARIANT MATCHING ---
 # =========================================================================
 
 def normalize_price(price_input: Any) -> Optional[float]:
     """
     Safely normalizes various price formats into a clean numeric float.
     Handles '₹67,999.00', 'Rs. 48,999', '51,999', 48999, None, etc.
+    Correctly excludes EMI amounts (e.g. '₹1,250/month'), discount badges
+    ('₹2,000 off', '15% off'), and star ratings ('4.5 out of 5 stars').
     """
     if price_input is None:
         return None
@@ -111,40 +198,157 @@ def normalize_price(price_input: Any) -> Optional[float]:
         return val if val > 0 else None
     
     s = str(price_input).strip()
-    # Remove prefix currency words like 'Rs.', 'INR', '₹', 'Rs'
-    s = re.sub(r'(?i)\b(rs|inr|rupees?)\b\.?', '', s)
-    s = s.replace('₹', '').replace(',', '').strip()
-    
-    match = re.search(r'(\d+(?:\.\d{1,2})?)', s)
-    if match:
+    if not s:
+        return None
+
+    # 1. Clean discount / savings prefixes
+    s_cleaned = re.sub(r'(?i)\b(?:save|get|upto|up to)\s*(?:[\u20b9]|rs\.?|inr)?\s*[\d,]+(?:\.\d{1,2})?', '', s)
+    s_cleaned = re.sub(r'(?i)(?:[\u20b9]|rs\.?|inr)?\s*[\d,]+(?:\.\d{1,2})?\s*(?:%|percent)?\s*(?:off|cashback|discount)', '', s_cleaned)
+    # 2. Clean EMI rates
+    s_cleaned = re.sub(r'(?i)(?:[\u20b9]|rs\.?|inr)?\s*[\d,]+(?:\.\d{1,2})?\s*\/\s*(?:mo|month|pm)\b', '', s_cleaned)
+    s_cleaned = re.sub(r'(?i)\bemi\s*(?:from|starts?\s*at)\s*(?:[\u20b9]|rs\.?|inr)?\s*[\d,]+(?:\.\d{1,2})?', '', s_cleaned)
+    s_cleaned = re.sub(r'(?i)\b(?:no\s+cost\s+)?emi\b', '', s_cleaned)
+    # 3. Clean rating numbers
+    s_cleaned = re.sub(r'(?i)\b\d+(?:\.\d+)?\s*(?:out of|\/5|\/ 5|stars?|ratings?|reviews?)\b', '', s_cleaned)
+
+    # 4. Look for currency symbol followed directly by numeric price
+    m = re.search(r'(?:[\u20b9]|rs\.?|inr)\s*([\d,]+(?:\.\d{1,2})?)', s_cleaned, re.IGNORECASE)
+    if m:
         try:
-            val = float(match.group(1))
+            val = float(m.group(1).replace(',', ''))
+            return val if val > 0 else None
+        except ValueError:
+            pass
+
+    # 5. Fallback: Standalone numeric value
+    target = s_cleaned if s_cleaned.strip() else s
+    target = re.sub(r'(?i)\b(rs|inr|rupees?)\b\.?', '', target)
+    target = target.replace('\u20b9', '').replace('₹', '').replace(',', '').strip()
+    
+    m2 = re.search(r'\b(\d+(?:\.\d{1,2})?)\b', target)
+    if m2:
+        try:
+            val = float(m2.group(1))
             return val if val > 0 else None
         except ValueError:
             return None
+            
     return None
 
 
 def is_accessory(title: str, query: str) -> bool:
     """
-    Checks if a product title is likely an accessory when the user's query
-    was looking for a main device.
+    Checks if a product title is an accessory, third-party case, or replacement part
+    when the user is looking for a main device.
+    
+    Preserves genuine products like smartwatches (e.g. 'Apple Watch Series 9 GPS 45mm Aluminium Case with Sport Band')
+    while rejecting accessories (e.g. 'Silicone Case for iPhone 15', 'Screen Protector for Samsung S24',
+    'Compatible with iPhone 15 OLED Screen Replacement').
     """
     q_lower = query.lower()
     t_lower = title.lower()
-    
-    # If user explicitly searched for an accessory, do not reject
-    if any(k in q_lower for k in ACCESSORY_KEYWORDS):
-        return False
-        
-    # If title explicitly has accessory terms, flag it
-    for k in ACCESSORY_KEYWORDS:
-        # Check as whole word or phrase
-        pattern = r'\b' + re.escape(k) + r'\b'
-        if re.search(pattern, t_lower):
+
+    # If the user explicitly searched for an accessory keyword, don't reject
+    for kw in ACCESSORY_KEYWORDS:
+        if kw in q_lower:
+            return False
+
+    # Check clear accessory / compatibility phrases
+    for pat in ACCESSORY_PHRASES:
+        if re.search(pat, t_lower):
             return True
-            
+
+    # Check for '<accessory_noun> for/of <something>'
+    acc_nouns = r'(?:case|cover|glass|guard|protector|strap|band|cable|charger|adapter|battery|screen|digitizer|pouch|sleeve|skin|dock|stand|mount|holder|stylus)'
+    if re.search(r'\b' + acc_nouns + r'\s+(?:for|of)\b', t_lower):
+        return True
+
+    # Multi-pack accessories like 'Pack of 2', 'Set of 3' at beginning
+    if re.search(r'^(?:pack\s+of\s+\d+|set\s+of\s+\d+)\b', t_lower):
+        return True
+
     return False
+
+
+def extract_model_identifiers(text: str) -> set:
+    """
+    Extracts alphanumeric model codes (e.g. '15', 's24', '1000xm5', 'm2', '9', 'ps5')
+    while filtering out decimal dimensions (e.g. '15.93 cm'), storage units ('128gb'),
+    battery sizes ('5000mah'), network generations ('5g'), and years ('2024').
+    """
+    t = text.lower()
+    # Strip decimal dimensions, screen sizes, and unit measurements first
+    t = re.sub(r'\b\d+\.\d+\s*(?:cm|inch|-inch|\"|\'|inches)?\b', ' ', t)
+    t = re.sub(r'\b\d+\s*(?:cm|inch|-inch|\"|\'|inches|mm|gb|tb|mb|ram|rom|mah|w|hz|mp|g|kg)\b', ' ', t)
+    t = re.sub(r'\b(5g|4g|3g|lte|2020|2021|2022|2023|2024|2025|2026|2027)\b', ' ', t)
+    tokens = re.findall(r'\b[a-zA-Z0-9]*\d+[a-zA-Z0-9]*\b', t)
+    return set(tokens)
+
+
+def _has_brand(text: str, brand: str) -> bool:
+    """Checks for brand presence while avoiding false positives like 'Noise Cancellation'."""
+    if brand.lower() == 'noise':
+        return bool(re.search(r'\bnoise\b(?!\s*(?:cancellation|cancelling|reduction|canceling|isolation|isolating))', text, re.IGNORECASE))
+    return bool(re.search(r'\b' + re.escape(brand) + r'\b', text, re.IGNORECASE))
+
+
+def compute_relevance_score(title: str, query: str) -> float:
+    """
+    Computes a relevance score [0.0, 1.0] between a candidate product title and the user's query.
+    Enforces brand consistency and model identifier matching, effectively filtering out
+    sponsored ads and irrelevant models.
+    """
+    t_clean = title.lower()
+    q_clean = query.lower()
+
+    if is_accessory(title, query):
+        return 0.0
+
+    # 1. Brand conflict check: If query specifies a known brand/family, reject other major brands
+    # and require presence of the specified brand/family in the candidate title
+    for brand, family in KNOWN_BRANDS.items():
+        q_has = _has_brand(q_clean, brand) or any(_has_brand(q_clean, f) for f in family)
+        if q_has:
+            for other_b, other_f in KNOWN_BRANDS.items():
+                if other_b != brand:
+                    other_in_title = _has_brand(t_clean, other_b) or any(_has_brand(t_clean, f) for f in other_f)
+                    other_in_query = _has_brand(q_clean, other_b) or any(_has_brand(q_clean, f) for f in other_f)
+                    if other_in_title and not other_in_query:
+                        return 0.0
+            target_in_title = _has_brand(t_clean, brand) or any(_has_brand(t_clean, f) for f in family)
+            if not target_in_title:
+                return 0.0
+
+    # 2. Model identifiers check: Query model numbers must be matched in the title
+    q_models = extract_model_identifiers(q_clean)
+    if q_models:
+        t_models = extract_model_identifiers(t_clean)
+        # Check direct or substring model match (e.g. 'xm5' in '1000xm5')
+        matched = {qm for qm in q_models if any(qm == tm or qm in tm or tm in qm for tm in t_models)}
+        if not matched:
+            return 0.0
+        model_ratio = len(matched) / len(q_models)
+    else:
+        model_ratio = 1.0
+
+    # 3. Word overlap ratio
+    q_words = re.findall(r'[a-zA-Z0-9]+', q_clean)
+    t_words = set(re.findall(r'[a-zA-Z0-9]+', t_clean))
+    matched_words = [w for w in q_words if w in t_words or any(w in tw for tw in t_words)]
+    word_ratio = len(matched_words) / len(q_words) if q_words else 1.0
+
+    # 4. Modifiers alignment ('pro', 'max', 'ultra', 'plus', 'mini', 'air')
+    modifiers = {'pro', 'max', 'ultra', 'plus', 'mini', 'air', 'lite'}
+    q_mods = {w for w in q_words if w in modifiers}
+    t_mods = {w for w in t_words if w in modifiers}
+    mod_penalty = 1.0
+    if q_mods and not q_mods.issubset(t_mods):
+        mod_penalty *= 0.5
+    if not q_mods and t_mods:
+        mod_penalty *= 0.85
+
+    score = (word_ratio * 0.5 + model_ratio * 0.5) * mod_penalty
+    return round(score, 3)
 
 
 def extract_variant_info(title: str) -> str:
@@ -174,10 +378,6 @@ def get_default_platform_search_url(platform: str, query: str) -> str:
         return f"https://www.amazon.in/s?k={encoded_q}"
     elif "Flipkart" in platform:
         return f"https://www.flipkart.com/search?q={encoded_q}"
-    elif "Croma" in platform:
-        return f"https://www.croma.com/searchB?q={encoded_q}%3Arelevance&text={encoded_q}"
-    elif "Reliance" in platform:
-        return f"https://www.reliancedigital.in/search?q={encoded_q}"
     return f"https://www.google.com/search?q={encoded_q}"
 
 
@@ -187,12 +387,28 @@ def get_default_platform_search_url(platform: str, query: str) -> str:
 
 def search_flipkart(query: str, timeout: int = 8) -> ProductOffer:
     """
-    Searches Flipkart independently. Retrieves live title, direct product URL, and verified price.
+    Searches Flipkart independently. Retrieves live title, direct product URL, and verified selling price.
+    Ranks items by semantic relevance to eliminate accessories and unrelated search results.
     """
     platform = "Flipkart"
-    clean_q = query.strip()
+    # Sanitize query: strip control characters, limit length to prevent header/parameter injection
+    clean_q = re.sub(r'[\r\n\t\x00-\x1f\x7f-\x9f]', ' ', query).strip()
+    if len(clean_q) > 100:
+        clean_q = clean_q[:100].strip()
     search_url = get_default_platform_search_url(platform, clean_q)
     
+    if not REQUESTS_AVAILABLE or not BS4_AVAILABLE:
+        return ProductOffer(
+            platform=platform,
+            product_name=f"{clean_q.title()} on Flipkart",
+            price=None,
+            url=search_url,
+            availability="Check Store",
+            status="Could not verify (requests/bs4 not installed)",
+            is_verified=False,
+            notes="Please install requests and beautifulsoup4."
+        )
+
     try:
         response = requests.get(search_url, headers=FLIPKART_HEADERS, timeout=timeout)
         if response.status_code != 200:
@@ -210,21 +426,51 @@ def search_flipkart(query: str, timeout: int = 8) -> ProductOffer:
         soup = BeautifulSoup(response.text, 'html.parser')
         items = soup.select('div[data-id]')
         
+        candidates: List[Tuple[float, str, float, str]] = []  # (score, title, price, url)
+
         for item in items:
-            # Extract title
+            # 1. Extract title (supporting both standard list and grid layout)
+            title = ""
             img = item.select_one('img[alt]')
-            title = img['alt'].strip() if (img and img.get('alt')) else ""
+            if img and img.get('alt') and len(img['alt'].strip()) > 5:
+                title = img['alt'].strip()
             if not title:
-                t_el = item.select_one('div.KzDlHZ, div._4rR01T, a.s1Q9rs, a.wBy4wf')
+                a_t = item.select_one('a[title]')
+                if a_t and a_t.get('title'):
+                    title = a_t['title'].strip()
+            if not title:
+                t_el = item.select_one('div.KzDlHZ, div._4rR01T, a.s1Q9rs, a.wBy4wf, a.atJtCj, div.WKTcLC')
                 title = t_el.get_text(strip=True) if t_el else ""
             if not title:
                 continue
-                
-            # Filter accessories if user searched for main product
-            if is_accessory(title, clean_q):
+
+            # 2. Check relevance
+            score = compute_relevance_score(title, clean_q)
+            if score < 0.4:
                 continue
-                
-            # Extract URL
+
+            # 3. Extract price: prioritize active selling price classes, avoid strikethrough MRP & EMI
+            price = None
+            p_el = item.select_one('div.Nx9bqj, div._30jeq3, div._16Jk6d')
+            if p_el:
+                price = normalize_price(p_el.get_text(strip=True))
+
+            if not price:
+                for el in item.find_all(True):
+                    txt = el.get_text(strip=True)
+                    classes = el.get('class', [])
+                    # Skip strikethrough MRP classes or discount badges
+                    if any(c in classes for c in ['yRaY8j', '_3I9_wc', '_27AhL0']):
+                        continue
+                    if txt.startswith('₹') and len(el.find_all(True)) == 0 and not any(k in txt.lower() for k in ['off', 'emi', 'month', 'save']):
+                        price = normalize_price(txt)
+                        if price and price > 0:
+                            break
+
+            if not price or price <= 0:
+                continue
+
+            # 4. Extract direct product URL
             a = item.select_one('a[href]')
             href = a['href'] if (a and a.get('href')) else ""
             if href.startswith('/'):
@@ -233,31 +479,28 @@ def search_flipkart(query: str, timeout: int = 8) -> ProductOffer:
                 product_url = href
             else:
                 product_url = search_url
+
+            candidates.append((score, title, price, product_url))
+
+        # Sort candidates: highest relevance score first, then lowest price
+        candidates.sort(key=lambda x: (-x[0], x[2]))
+
+        if candidates:
+            best_score, best_title, best_price, best_url = candidates[0]
+            variant = extract_variant_info(best_title)
+            return ProductOffer(
+                platform=platform,
+                product_name=best_title,
+                price=best_price,
+                url=best_url,
+                availability="In Stock",
+                variant=variant,
+                status="Verified Live Price",
+                is_verified=True,
+                notes="Verified via Flipkart live listing."
+            )
                 
-            # Extract price
-            price = None
-            for el in item.find_all(True):
-                txt = el.get_text(strip=True)
-                if txt.startswith('₹') and len(el.find_all(True)) == 0:
-                    price = normalize_price(txt)
-                    if price:
-                        break
-                        
-            if price and price > 0:
-                variant = extract_variant_info(title)
-                return ProductOffer(
-                    platform=platform,
-                    product_name=title,
-                    price=price,
-                    url=product_url,
-                    availability="In Stock",
-                    variant=variant,
-                    status="Verified Live Price",
-                    is_verified=True,
-                    notes="Verified via Flipkart live listing."
-                )
-                
-        # If no item with price was found
+        # If no relevant item with price was found
         return ProductOffer(
             platform=platform,
             product_name=f"{clean_q.title()} (Search listing)",
@@ -266,7 +509,7 @@ def search_flipkart(query: str, timeout: int = 8) -> ProductOffer:
             availability="Check Store",
             status="Price unavailable",
             is_verified=False,
-            notes="No direct pricing found in search results."
+            notes="No directly matched product with listed price found."
         )
         
     except Exception as e:
@@ -285,263 +528,175 @@ def search_flipkart(query: str, timeout: int = 8) -> ProductOffer:
 def search_amazon(query: str, timeout: int = 8) -> ProductOffer:
     """
     Searches Amazon India independently. Retrieves live title, direct product URL, and verified price.
+    Ranks items by semantic relevance to eliminate accessories and sponsored ads.
     Gracefully handles bot detection / CAPTCHA without inventing fake prices.
     """
     platform = "Amazon India"
-    clean_q = query.strip()
+    # Sanitize query: strip control characters, limit length to prevent header/parameter injection
+    clean_q = re.sub(r'[\r\n\t\x00-\x1f\x7f-\x9f]', ' ', query).strip()
+    if len(clean_q) > 100:
+        clean_q = clean_q[:100].strip()
     search_url = get_default_platform_search_url(platform, clean_q)
     
-    try:
-        response = requests.get(search_url, headers=BROWSER_HEADERS, timeout=timeout)
-        
-        # Check for bot detection / CAPTCHA
-        if response.status_code == 503 or "api-services-support@amazon.com" in response.text or "Robot Check" in response.text:
-            return ProductOffer(
-                platform=platform,
-                product_name=f"{clean_q.title()} on Amazon",
-                price=None,
-                url=search_url,
-                availability="Unknown",
-                status="Could not verify (Anti-bot protection)",
-                is_verified=False,
-                notes="Amazon automated request challenged by anti-bot verification. Click View Deal to check live in browser."
-            )
-            
-        if response.status_code != 200:
-            return ProductOffer(
-                platform=platform,
-                product_name=f"{clean_q.title()} on Amazon",
-                price=None,
-                url=search_url,
-                availability="Unknown",
-                status=f"Could not verify (HTTP {response.status_code})",
-                is_verified=False,
-                notes=f"HTTP status {response.status_code}"
-            )
-            
-        html = response.content.decode('utf-8', errors='ignore')
-        soup = BeautifulSoup(html, 'html.parser')
-        cards = soup.find_all('div', attrs={'data-component-type': 's-search-result'})
-        
-        for card in cards:
-            title = ""
-            product_url = ""
-            
-            # 1. Search anchors for direct product link and full descriptive title
-            for a in card.find_all('a'):
-                href = a.get('href', '')
-                if any(x in href for x in ['/dp/', '/gp/product/', '/sspa/click']):
-                    span = a.find('span')
-                    txt = span.get_text(strip=True) if span else a.get_text(strip=True)
-                    if len(txt) > 12 and not any(skip in txt.lower() for skip in ['bought in past', 'save extra', 'see more', 'stars', 'colors', 'deal']):
-                        title = txt
-                        asin = card.get('data-asin')
-                        if asin:
-                            product_url = f"https://www.amazon.in/dp/{asin}"
-                        elif href.startswith('http'):
-                            product_url = href
-                        else:
-                            product_url = f"https://www.amazon.in{href}"
-                        break
-                        
-            # 2. Fallback to h2 if anchor title not found
-            if not title:
-                h2 = card.find('h2')
-                if h2:
-                    span = h2.find('span')
-                    t = span.get_text(strip=True) if span else h2.get_text(strip=True)
-                    if len(t) > 5:
-                        title = t
-                        
-            if not title:
-                continue
-                
-            # Filter accessories
-            if is_accessory(title, clean_q):
-                continue
-                
-            # Extract price
-            price_el = card.find('span', class_='a-offscreen') or card.find('span', class_='a-price-whole')
-            price = normalize_price(price_el.get_text(strip=True) if price_el else None)
-            if not price:
-                continue
-                
-            if not product_url:
-                asin = card.get('data-asin')
-                product_url = f"https://www.amazon.in/dp/{asin}" if asin else search_url
-                    
-            variant = extract_variant_info(title)
-            return ProductOffer(
-                platform=platform,
-                product_name=title,
-                price=price,
-                url=product_url,
-                availability="In Stock",
-                variant=variant,
-                status="Verified Live Price",
-                is_verified=True,
-                notes="Verified via Amazon India live listing."
-            )
-            
-        return ProductOffer(
-            platform=platform,
-            product_name=f"{clean_q.title()} (Search listing)",
-            price=None,
-            url=search_url,
-            availability="Check Store",
-            status="Price unavailable",
-            is_verified=False,
-            notes="No directly matched product with listed price found."
-        )
-        
-    except Exception as e:
+    if not REQUESTS_AVAILABLE or not BS4_AVAILABLE:
         return ProductOffer(
             platform=platform,
             product_name=f"{clean_q.title()} on Amazon",
             price=None,
             url=search_url,
-            availability="Unknown",
-            status="Could not verify (Network error)",
+            availability="Check Store",
+            status="Could not verify (requests/bs4 not installed)",
             is_verified=False,
-            notes=str(e)
+            notes="Please install requests and beautifulsoup4."
         )
 
+    # Determine query variants: if searching for iPhone, also consider adding Apple prefix if needed
+    query_variants = [clean_q]
+    q_low = clean_q.lower()
+    if (q_low.startswith("iphone") or q_low.startswith("ipad") or q_low.startswith("macbook")) and not q_low.startswith("apple"):
+        query_variants.append(f"Apple {clean_q}")
 
-def search_croma(query: str, timeout: int = 8) -> ProductOffer:
-    """
-    Searches Croma independently.
-    Handles Akamai bot-manager restriction honestly.
-    Provides direct, verified search URL to view product in user's browser.
-    """
-    platform = "Croma"
-    clean_q = query.strip()
-    search_url = get_default_platform_search_url(platform, clean_q)
-    
-    try:
-        response = requests.get(search_url, headers=BROWSER_HEADERS, timeout=timeout)
-        if response.status_code == 403:
-            return ProductOffer(
-                platform=platform,
-                product_name=f"{clean_q.title()} on Croma",
-                price=None,
-                url=search_url,
-                availability="Unknown",
-                status="Could not verify (Access restricted / WAF)",
-                is_verified=False,
-                notes="Croma uses Akamai Bot Manager which restricts direct automated requests. Direct store search link provided."
-            )
-            
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            # Look for product cards if accessible
-            items = soup.select('li.product-item, div.cp-product')
-            for it in items:
-                title_el = it.select_one('h3.product-title, a.product-title')
-                price_el = it.select_one('span.amount, span.pdpPrice')
-                link_el = it.select_one('a[href]')
+    headers_pool = [AMAZON_HEADERS, AMAZON_ALT_HEADERS]
+    last_error_status = "Could not verify (Network error)"
+    anti_bot_detected = False
+
+    for q_attempt in query_variants:
+        encoded_term = urllib.parse.quote(q_attempt)
+        target_url = f"https://www.amazon.in/s?k={encoded_term}"
+
+        for headers in headers_pool:
+            try:
+                response = requests.get(target_url, headers=headers, timeout=timeout)
                 
-                title = title_el.get_text(strip=True) if title_el else ""
-                price = normalize_price(price_el.get_text(strip=True) if price_el else None)
-                if title and price and not is_accessory(title, clean_q):
-                    href = link_el['href'] if link_el else ""
-                    p_url = href if href.startswith('http') else f"https://www.croma.com{href}"
+                # Check for anti-bot challenges (Akamai bm-verify, AWS WAF, Robot Check, 503)
+                if response.status_code == 503 or "bm-verify" in response.text or "Robot Check" in response.text or "api-services-support@amazon.com" in response.text:
+                    anti_bot_detected = True
+                    last_error_status = "Could not verify (Anti-bot protection)"
+                    continue  # Try next headers in pool
+                    
+                if response.status_code != 200:
+                    last_error_status = f"Could not verify (HTTP {response.status_code})"
+                    continue
+
+                html = response.content.decode('utf-8', errors='ignore')
+                soup = BeautifulSoup(html, 'html.parser')
+                cards = soup.find_all('div', attrs={'data-component-type': 's-search-result'})
+                
+                if not cards:
+                    continue
+
+                candidates: List[Tuple[float, str, float, str]] = []  # (score, title, price, url)
+
+                for card in cards:
+                    # Collect brand prefix if present (often in a-size-mini header)
+                    brand_prefix = ""
+                    for h in card.find_all('h2'):
+                        h_classes = h.get('class', [])
+                        if 'a-size-mini' in h_classes or 's-line-clamp-1' in h_classes:
+                            txt = h.get_text(strip=True)
+                            if txt and len(txt) < 20:
+                                brand_prefix = txt
+                                break
+
+                    # 1. Extract title: check aria-label, descriptive h2, a.a-text-normal
+                    title = ""
+                    for h2 in card.find_all('h2'):
+                        if 'a-size-mini' in h2.get('class', []) and len(h2.get_text(strip=True)) < 20:
+                            continue
+                        if h2.get('aria-label'):
+                            title = h2['aria-label'].strip()
+                            break
+                        t = h2.get_text(strip=True)
+                        if len(t) > len(title):
+                            title = t
+
+                    if not title or len(title) < 10:
+                        for a in card.select('a.a-text-normal, a.s-line-clamp-2, a.s-line-clamp-3, a.s-line-clamp-4'):
+                            t = a.get_text(strip=True)
+                            if len(t) > len(title):
+                                title = t
+
+                    if brand_prefix and brand_prefix.lower() not in title.lower():
+                        title = f"{brand_prefix} {title}"
+
+                    if not title or len(title) < 5:
+                        continue
+
+                    # 2. Check relevance
+                    score = compute_relevance_score(title, clean_q)
+                    if score < 0.4:
+                        continue
+
+                    # 3. Extract price: prioritize active deal price, avoid strikethrough M.R.P. (a-text-price)
+                    p_off = card.select_one('span.a-price:not(.a-text-price) span.a-offscreen') or card.find('span', class_='a-offscreen')
+                    p_raw = p_off.get_text(strip=True) if p_off else None
+                    price = normalize_price(p_raw)
+
+                    if not price or price <= 0:
+                        p_wh = card.select_one('span.a-price:not(.a-text-price) span.a-price-whole') or card.find('span', class_='a-price-whole')
+                        price = normalize_price(p_wh.get_text(strip=True) if p_wh else None)
+
+                    if not price or price <= 0:
+                        continue
+
+                    # 4. Extract product URL
+                    a_link = card.find('a', href=lambda h: h and ('/dp/' in h or '/gp/' in h)) or card.select_one('h2 a')
+                    href = a_link['href'] if (a_link and a_link.get('href')) else ""
+                    asin = card.get('data-asin')
+
+                    if asin:
+                        product_url = f"https://www.amazon.in/dp/{asin}"
+                    elif href.startswith('http'):
+                        product_url = href
+                    elif href:
+                        product_url = f"https://www.amazon.in{href}"
+                    else:
+                        product_url = search_url
+
+                    candidates.append((score, title, price, product_url))
+
+                # Sort candidates: highest relevance score first, then lowest price
+                candidates.sort(key=lambda x: (-x[0], x[2]))
+
+                if candidates:
+                    best_score, best_title, best_price, best_url = candidates[0]
+                    variant = extract_variant_info(best_title)
                     return ProductOffer(
                         platform=platform,
-                        product_name=title,
-                        price=price,
-                        url=p_url,
+                        product_name=best_title,
+                        price=best_price,
+                        url=best_url,
                         availability="In Stock",
-                        variant=extract_variant_info(title),
+                        variant=variant,
                         status="Verified Live Price",
-                        is_verified=True
+                        is_verified=True,
+                        notes="Verified via Amazon India live listing."
                     )
-                    
+            except Exception as e:
+                last_error_status = f"Could not verify ({type(e).__name__})"
+
+    if anti_bot_detected:
         return ProductOffer(
             platform=platform,
-            product_name=f"{clean_q.title()} on Croma",
+            product_name=f"{clean_q.title()} on Amazon",
             price=None,
             url=search_url,
             availability="Check Store",
-            status="Could not verify (Requires browser verification)",
+            status="Could not verify (Anti-bot protection)",
             is_verified=False,
-            notes="Direct automated search did not return server-rendered price data."
-        )
-        
-    except Exception as e:
-        return ProductOffer(
-            platform=platform,
-            product_name=f"{clean_q.title()} on Croma",
-            price=None,
-            url=search_url,
-            availability="Unknown",
-            status="Could not verify (Connection error)",
-            is_verified=False,
-            notes=str(e)
+            notes="Amazon automated request challenged by anti-bot verification. Click View Deal to check live in browser."
         )
 
-
-def search_reliance(query: str, timeout: int = 8) -> ProductOffer:
-    """
-    Searches Reliance Digital independently.
-    Handles client-side Single-Page Application (SPA) architecture honestly.
-    Provides direct, verified search URL to view product in user's browser.
-    """
-    platform = "Reliance Digital"
-    clean_q = query.strip()
-    search_url = get_default_platform_search_url(platform, clean_q)
-    
-    try:
-        response = requests.get(search_url, headers=BROWSER_HEADERS, timeout=timeout)
-        if response.status_code == 200:
-            # Reliance Digital renders product listings client-side via React
-            # Check if server-side rendered products exist in script or HTML
-            html = response.text
-            if "sp__name" in html or "slider-text" in html:
-                soup = BeautifulSoup(html, 'html.parser')
-                items = soup.select('div.sp, li.grid')
-                for it in items:
-                    t_el = it.select_one('p.sp__name')
-                    p_el = it.select_one('span.gDOPPt, span.amount')
-                    if t_el and p_el:
-                        title = t_el.get_text(strip=True)
-                        price = normalize_price(p_el.get_text(strip=True))
-                        if title and price and not is_accessory(title, clean_q):
-                            a = it.select_one('a[href]')
-                            href = a['href'] if a else ""
-                            p_url = href if href.startswith('http') else f"https://www.reliancedigital.in{href}"
-                            return ProductOffer(
-                                platform=platform,
-                                product_name=title,
-                                price=price,
-                                url=p_url,
-                                availability="In Stock",
-                                variant=extract_variant_info(title),
-                                status="Verified Live Price",
-                                is_verified=True
-                            )
-
-        return ProductOffer(
-            platform=platform,
-            product_name=f"{clean_q.title()} on Reliance Digital",
-            price=None,
-            url=search_url,
-            availability="Check Store",
-            status="Could not verify (Client-side SPA / Verification required)",
-            is_verified=False,
-            notes="Reliance Digital catalog is rendered client-side. Click View Deal to see live offers in browser."
-        )
-        
-    except Exception as e:
-        return ProductOffer(
-            platform=platform,
-            product_name=f"{clean_q.title()} on Reliance Digital",
-            price=None,
-            url=search_url,
-            availability="Unknown",
-            status="Could not verify (Network error)",
-            is_verified=False,
-            notes=str(e)
-        )
+    return ProductOffer(
+        platform=platform,
+        product_name=f"{clean_q.title()} (Search listing)",
+        price=None,
+        url=search_url,
+        availability="Check Store",
+        status="Price unavailable",
+        is_verified=False,
+        notes="No directly matched product with listed price found."
+    )
 
 
 # =========================================================================
@@ -550,14 +705,15 @@ def search_reliance(query: str, timeout: int = 8) -> ProductOffer:
 
 def search_via_external_api(query: str) -> Dict[str, ProductOffer]:
     """
-    If the user has configured SERPAPI_API_KEY or RAPIDAPI_KEY in environment variables,
-    queries Google Shopping API to retrieve verified live listings for all four platforms.
+    If the user has configured SERPAPI_API_KEY in environment variables,
+    queries Google Shopping API to retrieve verified live listings for supported platforms.
+    Filters out accessories and irrelevant items.
     Returns a dictionary mapping platform name -> ProductOffer.
     """
     api_key = os.getenv("SERPAPI_API_KEY")
     results: Dict[str, ProductOffer] = {}
     
-    if not api_key:
+    if not api_key or not REQUESTS_AVAILABLE:
         return results
         
     try:
@@ -581,18 +737,16 @@ def search_via_external_api(query: str) -> Dict[str, ProductOffer]:
                     matched_platform = "Amazon India"
                 elif "flipkart" in source:
                     matched_platform = "Flipkart"
-                elif "croma" in source:
-                    matched_platform = "Croma"
-                elif "reliance" in source:
-                    matched_platform = "Reliance Digital"
                     
                 if matched_platform and matched_platform not in results:
                     title = item.get("title", "")
-                    if is_accessory(title, query):
+                    score = compute_relevance_score(title, query)
+                    if score < 0.4:
                         continue
+
                     price_val = normalize_price(item.get("extracted_price") or item.get("price"))
                     link = item.get("product_link") or item.get("link") or get_default_platform_search_url(matched_platform, query)
-                    if price_val:
+                    if price_val and price_val > 0:
                         results[matched_platform] = ProductOffer(
                             platform=matched_platform,
                             product_name=title,
@@ -616,47 +770,38 @@ def search_via_external_api(query: str) -> Dict[str, ProductOffer]:
 
 def search_all_platforms(query: str) -> List[ProductOffer]:
     """
-    Searches all four platforms independently:
+    Searches supported platforms independently:
     - Amazon India
     - Flipkart
-    - Croma
-    - Reliance Digital
     
     Does NOT hardcode any platform or fabricate prices.
     Uses optional external API if configured, otherwise executes independent workers.
     """
-    clean_q = query.strip()
+    # Sanitize query: strip control characters, limit length to prevent header/parameter injection
+    clean_q = re.sub(r'[\r\n\t\x00-\x1f\x7f-\x9f]', ' ', query).strip()
+    if len(clean_q) > 100:
+        clean_q = clean_q[:100].strip()
     
     # 1. Check if external API (e.g. SerpApi) is configured
     external_offers = search_via_external_api(clean_q)
     
-    # 2. Query each platform independently
+    # 2. Query each platform concurrently
     offers: List[ProductOffer] = []
-    
-    # Amazon
-    if "Amazon India" in external_offers:
-        offers.append(external_offers["Amazon India"])
-    else:
-        offers.append(search_amazon(clean_q))
-        
-    # Flipkart
-    if "Flipkart" in external_offers:
-        offers.append(external_offers["Flipkart"])
-    else:
-        offers.append(search_flipkart(clean_q))
-        
-    # Croma
-    if "Croma" in external_offers:
-        offers.append(external_offers["Croma"])
-    else:
-        offers.append(search_croma(clean_q))
-        
-    # Reliance Digital
-    if "Reliance Digital" in external_offers:
-        offers.append(external_offers["Reliance Digital"])
-    else:
-        offers.append(search_reliance(clean_q))
-        
+
+    def get_amazon():
+        return external_offers.get("Amazon India") or search_amazon(clean_q)
+
+    def get_flipkart():
+        return external_offers.get("Flipkart") or search_flipkart(clean_q)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        f_amz = executor.submit(get_amazon)
+        f_flp = executor.submit(get_flipkart)
+
+        # Maintain consistent platform display order: Amazon India, Flipkart
+        offers.append(f_amz.result())
+        offers.append(f_flp.result())
+
     return offers
 
 
@@ -667,11 +812,11 @@ def evaluate_price_comparison(offers: List[ProductOffer], user_budget: float) ->
     Cases implemented:
     - Case A: One or more platforms have a price below the user's budget.
               Recommend the lowest verified price, showing savings.
-    - Case B: All four platforms have prices above the user's budget.
+    - Case B: All verified platforms have prices above the user's budget.
               Clearly state that no verified offer is available below budget.
               Recommend the lowest verified price among available options and
               show how much it exceeds the budget.
-    - Case C: Another platform is cheaper than Flipkart.
+    - Case C: Another platform is cheaper than Flipkart (e.g. Amazon India).
               Recommends whichever platform has the genuinely lowest price.
     - Case D: Platform cannot be searched / verified.
               Marked as 'Could not verify' without assuming 0 or inventing prices.

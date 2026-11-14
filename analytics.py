@@ -25,7 +25,7 @@ def load_dataframe(transactions):
 def get_monthly_summary(df, year=None, month=None):
     """
     Returns total income, total expense, net savings, and savings rate.
-    If year and month are none, defaults to current month.
+    If year and month are none, defaults to current month (or latest active month).
     """
     if df.empty:
         return {"income": 0.0, "expense": 0.0, "savings": 0.0, "savings_rate": 0.0}
@@ -33,12 +33,20 @@ def get_monthly_summary(df, year=None, month=None):
     if "profile" in df.columns:
         df = df[df["profile"] == "Personal"]
 
+    if df.empty:
+        return {"income": 0.0, "expense": 0.0, "savings": 0.0, "savings_rate": 0.0}
+
     if year is None or month is None:
         today = date.today()
         year, month = today.year, today.month
-        
-    # Filter for the specific month/year
-    month_df = df[(df["year"] == year) & (df["month"] == month)]
+        month_df = df[(df["year"] == year) & (df["month"] == month)]
+        if month_df.empty:
+            latest_date = df["date"].max()
+            if pd.notna(latest_date):
+                year, month = latest_date.year, latest_date.month
+                month_df = df[(df["year"] == year) & (df["month"] == month)]
+    else:
+        month_df = df[(df["year"] == year) & (df["month"] == month)]
     
     if month_df.empty:
         return {"income": 0.0, "expense": 0.0, "savings": 0.0, "savings_rate": 0.0}
@@ -68,11 +76,24 @@ def get_category_wise_spending(df, year=None, month=None):
     if "profile" in df.columns:
         df = df[df["profile"] == "Personal"]
 
+    if df.empty:
+        return {}
+
+    exp_df = df[df["type"] == "Expense"]
+    if exp_df.empty:
+        return {}
+
     if year is None or month is None:
         today = date.today()
         year, month = today.year, today.month
-        
-    month_expense = df[(df["year"] == year) & (df["month"] == month) & (df["type"] == "Expense")]
+        month_expense = exp_df[(exp_df["year"] == year) & (exp_df["month"] == month)]
+        if month_expense.empty:
+            latest_date = exp_df["date"].max()
+            if pd.notna(latest_date):
+                year, month = latest_date.year, latest_date.month
+                month_expense = exp_df[(exp_df["year"] == year) & (exp_df["month"] == month)]
+    else:
+        month_expense = exp_df[(exp_df["year"] == year) & (exp_df["month"] == month)]
     
     if month_expense.empty:
         return {}
@@ -100,11 +121,25 @@ def get_average_daily_spending(df, year=None, month=None):
     if "profile" in df.columns:
         df = df[df["profile"] == "Personal"]
 
+    if df.empty:
+        return 0.0
+
+    exp_df = df[df["type"] == "Expense"]
+    if exp_df.empty:
+        return 0.0
+
     today = date.today()
     if year is None or month is None:
         year, month = today.year, today.month
-        
-    month_expense = df[(df["year"] == year) & (df["month"] == month) & (df["type"] == "Expense")]
+        month_expense = exp_df[(exp_df["year"] == year) & (exp_df["month"] == month)]
+        if month_expense.empty:
+            latest_date = exp_df["date"].max()
+            if pd.notna(latest_date):
+                year, month = latest_date.year, latest_date.month
+                month_expense = exp_df[(exp_df["year"] == year) & (exp_df["month"] == month)]
+    else:
+        month_expense = exp_df[(exp_df["year"] == year) & (exp_df["month"] == month)]
+
     if month_expense.empty:
         return 0.0
         
@@ -112,95 +147,215 @@ def get_average_daily_spending(df, year=None, month=None):
     
     # Calculate days in the selected month
     if year == today.year and month == today.month:
-        # If current month, use today's date to divide by elapsed days
-        days = today.day
+        # If current month, use elapsed days
+        days = max(today.day, 1)
     else:
         # Use total days in that calendar month
         _, days = calendar.monthrange(int(year), int(month))
         
     return round(float(total_expense / max(days, 1)), 2)
 
-def get_spending_insights(df):
+def get_monthly_spending_trends(df, num_months=6):
     """
-    Compares the current month's expenses with the previous month's.
-    If no previous month, compares to the general historical average.
+    Computes multi-month trend analysis for Personal finances using Pandas.
+    Returns:
+        dict with keys: 'months', 'income', 'expense', 'savings', 'pct_change', 'direction'
     """
+    empty_result = {
+        "months": [],
+        "income": [],
+        "expense": [],
+        "savings": [],
+        "pct_change": [],
+        "direction": []
+    }
     if df.empty:
-        return ["No transaction history to analyze yet. Add transactions to see insights!"]
+        return empty_result
         
     if "profile" in df.columns:
         df = df[df["profile"] == "Personal"]
+        
+    if df.empty:
+        return empty_result
+
+    # Group by Year-Month and Type
+    df_copy = df.copy()
+    df_copy["period"] = df_copy["date"].dt.to_period("M")
+    
+    unique_periods = sorted(df_copy["period"].unique())[-num_months:]
+    if not unique_periods:
+        return empty_result
+        
+    df_filtered = df_copy[df_copy["period"].isin(unique_periods)]
+    
+    # Pivot table: rows = period, columns = type ('Income', 'Expense')
+    pivot = df_filtered.pivot_table(
+        index="period",
+        columns="type",
+        values="amount",
+        aggfunc="sum",
+        fill_value=0.0
+    )
+    
+    if "Income" not in pivot.columns:
+        pivot["Income"] = 0.0
+    if "Expense" not in pivot.columns:
+        pivot["Expense"] = 0.0
+        
+    pivot = pivot.sort_index()
+    
+    months_labels = [p.strftime("%b %Y") for p in pivot.index]
+    incomes = [round(float(v), 2) for v in pivot["Income"]]
+    expenses = [round(float(v), 2) for v in pivot["Expense"]]
+    savings = [round(float(inc - exp), 2) for inc, exp in zip(incomes, expenses)]
+    
+    # Calculate MoM % change in expense
+    pct_changes = []
+    directions = []
+    prev_exp = None
+    for exp in expenses:
+        if prev_exp is None or prev_exp == 0:
+            pct_changes.append(0.0)
+            directions.append("flat")
+        else:
+            diff = ((exp - prev_exp) / prev_exp) * 100.0
+            pct_changes.append(round(diff, 1))
+            if diff > 0.5:
+                directions.append("increased")
+            elif diff < -0.5:
+                directions.append("decreased")
+            else:
+                directions.append("flat")
+        prev_exp = exp
+        
+    return {
+        "months": months_labels,
+        "income": incomes,
+        "expense": expenses,
+        "savings": savings,
+        "pct_change": pct_changes,
+        "direction": directions
+    }
+
+def get_spending_insights(df):
+    """
+    Generates rich, data-driven spending insights using Pandas.
+    Extracts cash flow, top expense drivers, daily burn rates, MoM comparisons, and category shifts.
+    """
+    if df.empty:
+        return ["No transaction history found to analyze. Add transactions or click 'Load Demo Data' to generate insights."]
+
+    if "profile" in df.columns:
+        df = df[df["profile"] == "Personal"]
+
+    if df.empty:
+        return ["No personal transactions recorded. Add personal transactions to see financial insights."]
 
     insights = []
     today = date.today()
     curr_yr, curr_mo = today.year, today.month
-    
-    # Calculate last month's indices
+
+    # Determine primary month to analyze
+    curr_month_df = df[(df["year"] == curr_yr) & (df["month"] == curr_mo)]
+    if curr_month_df.empty:
+        latest_date = df["date"].max()
+        if pd.notna(latest_date):
+            curr_yr, curr_mo = latest_date.year, latest_date.month
+            curr_month_df = df[(df["year"] == curr_yr) & (df["month"] == curr_mo)]
+
+    # Calculate previous month indices relative to analyzed month
     if curr_mo == 1:
         prev_yr, prev_mo = curr_yr - 1, 12
     else:
         prev_yr, prev_mo = curr_yr, curr_mo - 1
-        
-    # Get expenses only
-    expenses_df = df[df["type"] == "Expense"]
-    if expenses_df.empty:
-        return ["No expenses recorded yet. Add expenses to get insights!"]
-        
-    curr_month_df = expenses_df[(expenses_df["year"] == curr_yr) & (expenses_df["month"] == curr_mo)]
-    prev_month_df = expenses_df[(expenses_df["year"] == prev_yr) & (expenses_df["month"] == prev_mo)]
-    
-    # Group by category
-    curr_by_cat = curr_month_df.groupby("category")["amount"].sum() if not curr_month_df.empty else pd.Series(dtype=float)
-    prev_by_cat = prev_month_df.groupby("category")["amount"].sum() if not prev_month_df.empty else pd.Series(dtype=float)
-    
-    # If we have comparisons
-    if not curr_by_cat.empty and not prev_by_cat.empty:
-        for cat in curr_by_cat.index:
-            curr_amt = curr_by_cat[cat]
-            if cat in prev_by_cat.index:
-                prev_amt = prev_by_cat[cat]
-                diff_pct = ((curr_amt - prev_amt) / prev_amt) * 100
-                if abs(diff_pct) >= 5:
-                    status_word = "more" if diff_pct > 0 else "less"
-                    insights.append(f"You spent {abs(diff_pct):.0f}% {status_word} on {cat} this month compared to last month.")
-            else:
-                insights.append(f"New category spend: You spent ₹{curr_amt:,.0f} on {cat} this month (no spending last month).")
-                
-        # Also check categories in previous but not in current
-        for cat in prev_by_cat.index:
-            if cat not in curr_by_cat.index:
-                insights.append(f"Great job! You saved 100% on {cat} this month (spent ₹{prev_by_cat[cat]:,.0f} last month).")
-    else:
-        # Fallback: Compare current month to historical average per category
-        hist_df = expenses_df[~((expenses_df["year"] == curr_yr) & (expenses_df["month"] == curr_mo))]
-        if not hist_df.empty:
-            # Group by year-month-category to find average monthly spend per category
-            hist_monthly = hist_df.groupby(["year", "month", "category"])["amount"].sum().reset_index()
-            cat_avg = hist_monthly.groupby("category")["amount"].mean()
-            
-            for cat in curr_by_cat.index:
-                curr_amt = curr_by_cat[cat]
-                if cat in cat_avg.index:
-                    avg_amt = cat_avg[cat]
-                    diff_pct = ((curr_amt - avg_amt) / avg_amt) * 100
-                    if abs(diff_pct) >= 5:
-                        status_word = "higher" if diff_pct > 0 else "lower"
-                        insights.append(f"Your {cat} spending is {abs(diff_pct):.0f}% {status_word} than your historical monthly average.")
+
+    prev_month_df = df[(df["year"] == prev_yr) & (df["month"] == prev_mo)]
+
+    month_name = date(curr_yr, curr_mo, 1).strftime("%B %Y")
+    prev_month_name = date(prev_yr, prev_mo, 1).strftime("%B %Y")
+
+    # 1. Cash Flow & Net Savings Insight
+    summary = get_monthly_summary(df, curr_yr, curr_mo)
+    income = summary["income"]
+    expense = summary["expense"]
+    savings = summary["savings"]
+    savings_rate = summary["savings_rate"]
+
+    if income > 0 or expense > 0:
+        if savings >= 0:
+            insights.append(
+                f"Cash Flow ({month_name}): Inflow of ₹{income:,.0f} vs Outflow of ₹{expense:,.0f}. "
+                f"You saved ₹{savings:,.0f} ({savings_rate:.1f}% savings rate)."
+            )
         else:
-            insights.append("Tracking started: Collect data for at least two months to see automatic month-over-month trends.")
-            
-    # Add general summaries
-    total_curr_exp = curr_month_df["amount"].sum() if not curr_month_df.empty else 0
-    total_prev_exp = prev_month_df["amount"].sum() if not prev_month_df.empty else 0
-    if total_curr_exp > 0 and total_prev_exp > 0:
-        diff_pct = ((total_curr_exp - total_prev_exp) / total_prev_exp) * 100
-        direction = "increased" if diff_pct > 0 else "decreased"
-        insights.insert(0, f"Overall spending has {direction} by {abs(diff_pct):.1f}% compared to last month.")
-        
+            insights.append(
+                f"Cash Flow Alert ({month_name}): Outflow (₹{expense:,.0f}) exceeded income (₹{income:,.0f}) "
+                f"by ₹{abs(savings):,.0f}."
+            )
+
+    # 2. Top Spending Category Driver
+    cat_spending = get_category_wise_spending(df, curr_yr, curr_mo)
+    if cat_spending and expense > 0:
+        top_cat = max(cat_spending, key=cat_spending.get)
+        top_amt = cat_spending[top_cat]
+        cat_pct = (top_amt / expense) * 100
+        insights.append(
+            f"Top Expense Driver: {top_cat} is your highest expense at ₹{top_amt:,.0f}, "
+            f"accounting for {cat_pct:.1f}% of total monthly spending."
+        )
+
+    # 3. Daily Spending Pace
+    daily_avg = get_average_daily_spending(df, curr_yr, curr_mo)
+    if daily_avg > 0:
+        insights.append(
+            f"Daily Spending Pace: You are spending an average of ₹{daily_avg:,.0f} per day in {month_name}."
+        )
+
+    # 4. Month-over-Month Spending Velocity
+    prev_expense = prev_month_df[prev_month_df["type"] == "Expense"]["amount"].sum() if not prev_month_df.empty else 0.0
+    if expense > 0 and prev_expense > 0:
+        mom_diff = ((expense - prev_expense) / prev_expense) * 100.0
+        status_word = "increased" if mom_diff > 0 else "decreased"
+        insights.append(
+            f"MoM Spending Trajectory: Total expenses {status_word} by {abs(mom_diff):.1f}% compared to {prev_month_name} "
+            f"(₹{expense:,.0f} vs ₹{prev_expense:,.0f})."
+        )
+
+    # 5. Category Shifts & Variances (>= 5% change)
+    if not prev_month_df.empty:
+        prev_cats = prev_month_df[prev_month_df["type"] == "Expense"].groupby("category")["amount"].sum().to_dict()
+        shifts = []
+        for cat, amt in cat_spending.items():
+            if cat in prev_cats:
+                p_amt = prev_cats[cat]
+                shift_pct = ((amt - p_amt) / p_amt) * 100.0
+                if abs(shift_pct) >= 5.0:
+                    shifts.append((cat, shift_pct, amt, p_amt))
+
+        if shifts:
+            shifts.sort(key=lambda x: abs(x[1]), reverse=True)
+            biggest = shifts[0]
+            action = "increased" if biggest[1] > 0 else "reduced"
+            insights.append(
+                f"Key Category Shift: {biggest[0]} spending {action} by {abs(biggest[1]):.1f}% "
+                f"(₹{biggest[2]:,.0f} vs ₹{biggest[3]:,.0f} in {prev_month_name})."
+            )
+
+    # 6. Budget Diversification & Discipline
+    num_categories = len(cat_spending)
+    if num_categories >= 4:
+        insights.append(
+            f"Expense Diversification: Spending is distributed across {num_categories} categories, demonstrating thorough budget tracking."
+        )
+    elif num_categories > 0:
+        insights.append(
+            f"Expense Focus: Spending is concentrated in {num_categories} categories this month."
+        )
+
     if not insights:
         insights.append("Your expenses are stable and close to your standard averages. Keep it up!")
-        
-    return insights[:5]  # Limit to top 5 insights
+
+    return insights
 
 def calculate_health_score(df, budget_limit, goals, subscriptions):
     """

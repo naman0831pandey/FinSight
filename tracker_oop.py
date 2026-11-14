@@ -2,7 +2,7 @@ from datetime import datetime
 from db_manager import DatabaseManager
 
 class Transaction:
-    def __init__(self, id_, type_, amount, category, date, notes="", profile="Personal"):
+    def __init__(self, id_, type_, amount, category, date, notes="", profile="Personal", import_batch_id=None, source="Manual"):
         self.id = id_
         self.type = type_  # 'Income' or 'Expense'
         self.amount = float(amount)
@@ -10,6 +10,12 @@ class Transaction:
         self.date = date  # YYYY-MM-DD
         self.notes = notes
         self.profile = profile
+        self.import_batch_id = import_batch_id
+        self.source = source or ("Imported" if import_batch_id else "Manual")
+
+    @property
+    def is_imported(self):
+        return bool(self.import_batch_id)
 
     def to_dict(self):
         return {
@@ -19,11 +25,15 @@ class Transaction:
             "category": self.category,
             "date": self.date,
             "notes": self.notes,
-            "profile": self.profile
+            "profile": self.profile,
+            "import_batch_id": self.import_batch_id,
+            "source": self.source,
+            "is_imported": self.is_imported
         }
 
     def __repr__(self):
-        return f"Transaction({self.type}, ₹{self.amount}, {self.category}, {self.date}, Profile: {self.profile})"
+        src_tag = f", Source: {self.source}" if self.import_batch_id else ""
+        return f"Transaction({self.type}, ₹{self.amount}, {self.category}, {self.date}, Profile: {self.profile}{src_tag})"
 
 
 class SavingGoal:
@@ -127,8 +137,20 @@ class BudgetTracker:
             pass
 
     # --- Transaction OOP Interfaces ---
-    def add_transaction(self, type_, amount, category, date, notes="", profile="Personal"):
-        return self.db.add_transaction(type_, amount, category, date, notes, profile)
+    def add_transaction(self, type_, amount, category, date, notes="", profile="Personal", import_batch_id=None, source="Manual"):
+        return self.db.add_transaction(type_, amount, category, date, notes, profile, import_batch_id, source)
+
+    def get_excel_imports(self, profile="Personal", entity_type=None):
+        return self.db.get_excel_imports(profile=profile, entity_type=entity_type)
+
+    def remove_excel_import(self, batch_id):
+        return self.db.remove_excel_import(batch_id)
+
+    def get_business_excel_imports(self, entity_type=None):
+        return self.db.get_excel_imports(profile="Business", entity_type=entity_type)
+
+    def remove_business_excel_import(self, batch_id):
+        return self.db.remove_business_import(batch_id)
 
     def get_transactions(self):
         rows = self.db.get_all_transactions()

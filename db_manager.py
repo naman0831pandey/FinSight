@@ -3,11 +3,52 @@ import os
 
 class DatabaseManager:
     def __init__(self, db_name="finance_assistant.db"):
-        self.db_name = db_name
+        if not os.path.isabs(db_name):
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            self.db_name = os.path.join(base_dir, db_name)
+        else:
+            self.db_name = db_name
         self.init_db()
 
     def get_connection(self):
-        return sqlite3.connect(self.db_name)
+        conn = sqlite3.connect(self.db_name)
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA secure_delete = ON;")
+        return conn
+
+    @staticmethod
+    def validate_sqlite_db_file(filepath: str):
+        """
+        Validates that a file is a non-corrupt SQLite database file.
+        Checks existence, file size, the 16-byte SQLite header magic ('SQLite format 3\\x00'),
+        and executes PRAGMA quick_check to verify internal b-tree integrity.
+        Returns (is_valid: bool, error_message: str).
+        """
+        if not filepath or not os.path.isfile(filepath):
+            return False, "File does not exist or is not a readable file."
+        
+        try:
+            if os.path.getsize(filepath) < 100:
+                return False, "File is too small to be a valid SQLite database."
+            
+            with open(filepath, "rb") as f:
+                header = f.read(16)
+                if header != b"SQLite format 3\x00":
+                    return False, "File header does not match the SQLite format specification."
+                    
+            # Connect in read-only mode to verify integrity
+            conn = sqlite3.connect(f"file:{os.path.abspath(filepath)}?mode=ro", uri=True)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA quick_check;")
+            res = cursor.fetchone()
+            conn.close()
+            
+            if not res or res[0] != "ok":
+                return False, f"Database integrity check failed: {res[0] if res else 'Unknown error'}"
+                
+            return True, "OK"
+        except Exception as e:
+            return False, f"Failed to validate database file: {str(e)}"
 
     def init_db(self):
         conn = self.get_connection()
@@ -132,6 +173,82 @@ class DatabaseManager:
         except sqlite3.OperationalError:
             pass
 
+        try:
+            cursor.execute("ALTER TABLE transactions ADD COLUMN import_batch_id TEXT DEFAULT NULL")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE transactions ADD COLUMN source TEXT DEFAULT 'Manual'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        # Business Sales migrations for Excel import tracking
+        try:
+            cursor.execute("ALTER TABLE business_sales ADD COLUMN import_batch_id TEXT DEFAULT NULL")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE business_sales ADD COLUMN source TEXT DEFAULT 'Manual'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        # Business Expenses migrations for Excel import tracking
+        try:
+            cursor.execute("ALTER TABLE business_expenses ADD COLUMN import_batch_id TEXT DEFAULT NULL")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE business_expenses ADD COLUMN source TEXT DEFAULT 'Manual'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        # Inventory migrations for Excel import tracking
+        try:
+            cursor.execute("ALTER TABLE inventory ADD COLUMN import_batch_id TEXT DEFAULT NULL")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE inventory ADD COLUMN source TEXT DEFAULT 'Manual'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        # Create Excel Imports history tracking table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS excel_imports (
+                batch_id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                import_date TEXT NOT NULL,
+                total_rows INTEGER NOT NULL,
+                valid_rows INTEGER NOT NULL,
+                skipped_rows INTEGER NOT NULL,
+                date_min TEXT,
+                date_max TEXT,
+                total_amount REAL NOT NULL,
+                profile TEXT DEFAULT 'Personal',
+                notes TEXT,
+                entity_type TEXT DEFAULT 'Transactions'
+            )
+        """)
+
+        # excel_imports entity_type migration
+        try:
+            cursor.execute("ALTER TABLE excel_imports ADD COLUMN entity_type TEXT DEFAULT 'Transactions'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
         conn.commit()
 
         # Seed initial smart suggestions if empty
@@ -168,30 +285,44 @@ class DatabaseManager:
         conn.close()
 
     # --- Transactions CRUD ---
-    def add_transaction(self, type_, amount, category, date, notes="", profile="Personal"):
+    def add_transaction(self, type_, amount, category, date, notes="", profile="Personal", import_batch_id=None, source="Manual"):
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO transactions (type, amount, category, date, notes, profile)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (type_, amount, category, date, notes, profile))
+            INSERT INTO transactions (type, amount, category, date, notes, profile, import_batch_id, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (type_, amount, category, date, notes, profile, import_batch_id, source))
         conn.commit()
         last_id = cursor.lastrowid
         conn.close()
         return last_id
 
+    def add_transactions_batch(self, rows_to_insert):
+        """
+        Atomically inserts a batch of validated transactions.
+        rows_to_insert format: (type, amount, category, date, notes, profile, import_batch_id, source)
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.executemany("""
+            INSERT INTO transactions (type, amount, category, date, notes, profile, import_batch_id, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows_to_insert)
+        conn.commit()
+        conn.close()
+
     def get_all_transactions(self):
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT id, type, amount, category, date, notes, profile FROM transactions ORDER BY date DESC, id DESC")
+        cursor.execute("SELECT id, type, amount, category, date, notes, profile, import_batch_id, source FROM transactions ORDER BY date DESC, id DESC")
         rows = cursor.fetchall()
         conn.close()
         return rows
 
-    def search_transactions(self, keyword=None, category=None, date=None, profile=None):
+    def search_transactions(self, keyword=None, category=None, date=None, profile=None, source=None):
         conn = self.get_connection()
         cursor = conn.cursor()
-        query = "SELECT id, type, amount, category, date, notes, profile FROM transactions WHERE 1=1"
+        query = "SELECT id, type, amount, category, date, notes, profile, import_batch_id, source FROM transactions WHERE 1=1"
         params = []
         if keyword:
             query += " AND (category LIKE ? OR notes LIKE ?)"
@@ -205,11 +336,66 @@ class DatabaseManager:
         if profile:
             query += " AND profile = ?"
             params.append(profile)
+        if source:
+            if source == "Imported":
+                query += " AND import_batch_id IS NOT NULL"
+            elif source == "Manual":
+                query += " AND import_batch_id IS NULL"
         
         query += " ORDER BY date DESC, id DESC"
         cursor.execute(query, params)
         rows = cursor.fetchall()
         conn.close()
+        return rows
+
+    # --- Excel Imports Batch Management ---
+    def record_excel_import(self, batch_id, filename, import_date, total_rows, valid_rows, skipped_rows, date_min, date_max, total_amount, profile="Personal", notes="", entity_type="Transactions"):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO excel_imports (batch_id, filename, import_date, total_rows, valid_rows, skipped_rows, date_min, date_max, total_amount, profile, notes, entity_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (batch_id, filename, import_date, total_rows, valid_rows, skipped_rows, date_min, date_max, total_amount, profile, notes, entity_type))
+        conn.commit()
+        conn.close()
+
+    def get_excel_imports(self, profile="Personal", entity_type=None):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        query = "SELECT batch_id, filename, import_date, total_rows, valid_rows, skipped_rows, date_min, date_max, total_amount, profile, notes, entity_type FROM excel_imports WHERE profile = ?"
+        params = [profile]
+        if entity_type:
+            query += " AND entity_type = ?"
+            params.append(entity_type)
+        query += " ORDER BY import_date DESC"
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    def remove_excel_import(self, batch_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM transactions WHERE import_batch_id = ?", (batch_id,))
+        deleted_count = cursor.rowcount
+        cursor.execute("DELETE FROM excel_imports WHERE batch_id = ?", (batch_id,))
+        conn.commit()
+        conn.close()
+        return deleted_count
+
+    def remove_business_import(self, batch_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM business_sales WHERE import_batch_id = ?", (batch_id,))
+        sales_del = cursor.rowcount
+        cursor.execute("DELETE FROM business_expenses WHERE import_batch_id = ?", (batch_id,))
+        exp_del = cursor.rowcount
+        cursor.execute("DELETE FROM inventory WHERE import_batch_id = ?", (batch_id,))
+        inv_del = cursor.rowcount
+        cursor.execute("DELETE FROM excel_imports WHERE batch_id = ?", (batch_id,))
+        conn.commit()
+        conn.close()
+        return sales_del + exp_del + inv_del
         return rows
 
     def update_transaction(self, id_, type_, amount, category, date, notes="", profile="Personal"):
@@ -319,22 +505,35 @@ class DatabaseManager:
         return rows
 
     # --- Business Sales CRUD ---
-    def add_business_sale(self, date, customer_name, invoice_no, amount, payment_method):
+    def add_business_sale(self, date, customer_name, invoice_no, amount, payment_method, import_batch_id=None, source="Manual"):
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO business_sales (date, customer_name, invoice_no, amount, payment_method)
-            VALUES (?, ?, ?, ?, ?)
-        """, (date, customer_name, invoice_no, amount, payment_method))
+            INSERT INTO business_sales (date, customer_name, invoice_no, amount, payment_method, import_batch_id, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (date, customer_name, invoice_no, amount, payment_method, import_batch_id, source))
         conn.commit()
         last_id = cursor.lastrowid
         conn.close()
         return last_id
 
-    def get_all_business_sales(self):
+    def add_business_sales_batch(self, sales_tuples):
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT id, date, customer_name, invoice_no, amount, payment_method FROM business_sales ORDER BY date DESC, id DESC")
+        cursor.executemany("""
+            INSERT INTO business_sales (date, customer_name, invoice_no, amount, payment_method, import_batch_id, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, sales_tuples)
+        conn.commit()
+        conn.close()
+
+    def get_all_business_sales(self, include_meta=False):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if include_meta:
+            cursor.execute("SELECT id, date, customer_name, invoice_no, amount, payment_method, import_batch_id, source FROM business_sales ORDER BY date DESC, id DESC")
+        else:
+            cursor.execute("SELECT id, date, customer_name, invoice_no, amount, payment_method FROM business_sales ORDER BY date DESC, id DESC")
         rows = cursor.fetchall()
         conn.close()
         return rows
@@ -347,22 +546,35 @@ class DatabaseManager:
         conn.close()
 
     # --- Business Expenses CRUD ---
-    def add_business_expense(self, date, category, amount, notes=""):
+    def add_business_expense(self, date, category, amount, notes="", import_batch_id=None, source="Manual"):
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO business_expenses (date, category, amount, notes)
-            VALUES (?, ?, ?, ?)
-        """, (date, category, amount, notes))
+            INSERT INTO business_expenses (date, category, amount, notes, import_batch_id, source)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (date, category, amount, notes, import_batch_id, source))
         conn.commit()
         last_id = cursor.lastrowid
         conn.close()
         return last_id
 
-    def get_all_business_expenses(self):
+    def add_business_expenses_batch(self, expense_tuples):
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT id, date, category, amount, notes FROM business_expenses ORDER BY date DESC, id DESC")
+        cursor.executemany("""
+            INSERT INTO business_expenses (date, category, amount, notes, import_batch_id, source)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, expense_tuples)
+        conn.commit()
+        conn.close()
+
+    def get_all_business_expenses(self, include_meta=False):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if include_meta:
+            cursor.execute("SELECT id, date, category, amount, notes, import_batch_id, source FROM business_expenses ORDER BY date DESC, id DESC")
+        else:
+            cursor.execute("SELECT id, date, category, amount, notes FROM business_expenses ORDER BY date DESC, id DESC")
         rows = cursor.fetchall()
         conn.close()
         return rows
@@ -375,14 +587,14 @@ class DatabaseManager:
         conn.close()
 
     # --- Inventory CRUD ---
-    def add_inventory_item(self, item_name, stock, sold=0):
+    def add_inventory_item(self, item_name, stock, sold=0, import_batch_id=None, source="Manual"):
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
             cursor.execute("""
-                INSERT INTO inventory (item_name, stock, sold)
-                VALUES (?, ?, ?)
-            """, (item_name, stock, sold))
+                INSERT INTO inventory (item_name, stock, sold, import_batch_id, source)
+                VALUES (?, ?, ?, ?, ?)
+            """, (item_name, stock, sold, import_batch_id, source))
             conn.commit()
         except sqlite3.IntegrityError:
             cursor.execute("""
@@ -391,6 +603,25 @@ class DatabaseManager:
                 WHERE item_name = ?
             """, (stock, item_name))
             conn.commit()
+        conn.close()
+
+    def add_inventory_batch(self, inventory_tuples):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        for item in inventory_tuples:
+            name, stock, sold, batch_id, src = item
+            try:
+                cursor.execute("""
+                    INSERT INTO inventory (item_name, stock, sold, import_batch_id, source)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (name, stock, sold, batch_id, src))
+            except sqlite3.IntegrityError:
+                cursor.execute("""
+                    UPDATE inventory
+                    SET stock = stock + ?
+                    WHERE item_name = ?
+                """, (stock, name))
+        conn.commit()
         conn.close()
 
     def update_inventory_item(self, id_, stock, sold):
@@ -404,10 +635,13 @@ class DatabaseManager:
         conn.commit()
         conn.close()
 
-    def get_all_inventory(self):
+    def get_all_inventory(self, include_meta=False):
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT id, item_name, stock, sold FROM inventory ORDER BY item_name ASC")
+        if include_meta:
+            cursor.execute("SELECT id, item_name, stock, sold, import_batch_id, source FROM inventory ORDER BY item_name ASC")
+        else:
+            cursor.execute("SELECT id, item_name, stock, sold FROM inventory ORDER BY item_name ASC")
         rows = cursor.fetchall()
         conn.close()
         return rows

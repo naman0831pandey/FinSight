@@ -24,8 +24,8 @@
   - **🧬 Your Financial Profile**: Evaluates user spending archetypes (*e.g., Disciplined Wealth Builder*, *Balanced Lifestyle Spender*), overall health score out of 100, and essential vs. discretionary breakdowns.
   - **🎯 Savings Goal Planner**: Tracks active goals, projected completion timelines, and actionable savings advice.
   - **💡 Smart Category Assistant**: Suggests appropriate expense categories from freeform transaction descriptions.
-- **🛒 Smart Shopping Suggestions (4-Platform Independent Price Comparison)**:
-  - Independently compares real-time prices across **Amazon India**, **Flipkart**, **Croma**, and **Reliance Digital**.
+- **🛒 Smart Shopping Suggestions (Independent Price Comparison)**:
+  - Independently compares real-time prices across **Amazon India** and **Flipkart**.
   - Completely bias-free evaluation supporting deals below budget as well as cheapest available options exceeding budget.
   - Prominent **`🛒 Visit Cheapest Deal`** button dynamically opens the verified lowest offer in your default browser.
   - Individual **`🔗 View Deal`** buttons on every verified platform row.
@@ -34,6 +34,14 @@
   - Live category-based breakdown charts and monthly trend analytics.
 - **⏰ Subscription Manager**:
   - Tracks recurring digital subscriptions, renewal cycles, and monthly commitments.
+- **📥 Excel Import & Insights (Personal Finance Exclusive)**:
+  - **Spreadsheet Ingestion**: Select local `.xlsx` workbooks with multi-sheet discovery and tabular preview of rows.
+  - **Column Mapping**: Auto-detects and customizes column mappings for `Date`, `Type`, `Amount`, `Category`, and `Description`.
+  - **Data Validation & Duplicate Warnings**: Inspects rows for malformed dates, invalid amounts, and identifies intra-file duplicates as well as duplicates matching existing database records.
+  - **Safe Confirmation & Rollback**: Asks for user confirmation with a pre-import summary before committing. Allows reviewing past imports and rolling back (deleting) any imported batch while preserving all manual data.
+  - **Dataset Scope Visibility**: Displays active coverage banners (manual vs. imported counts, batch numbers, and exact date ranges) in both the Import view and Insight Engine.
+  - **100% Local Processing**: All parsing and analysis remain strictly local on your device.
+  - *Unsupported Formats*: Legacy `.xls` (Excel 97-2003), encrypted/password-protected workbooks, `.xlsb` (Excel Binary Workbook), and non-Excel tabular formats (`.csv`, `.tsv`, `.numbers`).
 - **📈 Reports & Document Generation**:
   - One-click printable **PDF Financial Health Statements** via ReportLab.
   - Full data backup, restore, and CSV/Excel ledger exports.
@@ -60,6 +68,14 @@
   - Salary tracking, department assignments, and payment statuses.
 - **🧾 Automated PDF Invoice Generator**:
   - Generates professional client invoices with itemized billing and company details.
+- **📥 Business ERP Excel Import & Insights (Exclusive)**:
+  - **Multi-Entity Ingestion**: Import `.xlsx` workbooks into **Daily Sales**, **Business Expenses**, or **Inventory / Stock**.
+  - **Dynamic Column Mapping**: Auto-detects columns tailored to the selected business entity with customizable dropdowns.
+  - **Validation & Duplicate Protection**: Flags missing required fields, non-numeric/negative amounts, in-file duplicates, and duplicates matching existing database invoices, expenses, or inventory items.
+  - **Batch Traceability & Rollback**: Commits imports with unique batch IDs and source tagging (`source='Imported: <filename>'`). Easily review past imports and roll back any batch with one click while preserving manual records.
+  - **Business Scope & Insights**: Aggregates manual vs. imported sales revenue, expense categories, inventory counts, and date ranges across the ERP Dashboard, P&L Calculator, and Reports.
+  - **100% Local Processing**: All files are parsed and stored offline; no spreadsheet data is transmitted externally.
+  - *Unsupported Formats*: Legacy `.xls` (Excel 97-2003), encrypted/password-protected workbooks, `.xlsb` (Excel Binary Workbook), and non-Excel tabular formats (`.csv`, `.tsv`, `.numbers`).
 
 ---
 
@@ -85,7 +101,7 @@
 ├── gui_theme.py                # Modern dark-mode palette, typography & vector widgets
 ├── gui_ai_view.py              # Dedicated Insight Engine dashboard view
 ├── ml_engine.py                # Time-series regression, clustering & anomaly detection
-├── price_comparison_service.py # 4-Platform web scraper & independent comparison logic
+├── price_comparison_service.py # Independent price scraper & comparison logic (Amazon & Flipkart)
 ├── tracker_oop.py              # Domain OOP classes (Transaction, Goal, Subscription, etc.)
 ├── db_manager.py               # SQLite connection manager & schema migrations
 ├── analytics.py                # Pandas financial metrics & aggregation utilities
