@@ -149,5 +149,6 @@ python test_price_comparison.py
 
 ## 👨‍💻 Developed By
 
-**Keshav Bhardwaj**  
-- GitHub: [@bhardwajkeshav208-ai](https://github.com/bhardwajkeshav208-ai)
+**Naman Pandey**  
+
+
